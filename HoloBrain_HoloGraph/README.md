@@ -15,7 +15,7 @@ HoloBrain_HoloGraph/
  ├─ train_brain.py                # Script for brain data
  ├─ train_cluster.py              # Script for unsupervised clustering
  └─ train_node.py                 # Script for node-level prediction
-
+```
 ---
 
 ## ⚙️ Installation
