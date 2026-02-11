@@ -1,4 +1,4 @@
-## From HoloBrain to HoloGraph: A Very First Step to Explore Machine Intelligence for Connecting Dots on Graphs
+## Explore brain-inspired machine intelligencefor connecting dots on graphs throughholographic blueprint of oscillatorysynchronizat
 
 ```plaintext
 HoloBrain_HoloGraph/
