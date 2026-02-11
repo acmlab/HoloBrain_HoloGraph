@@ -6,9 +6,10 @@ from torch_geometric.utils import to_dense_adj
 from source.layers.common_layers_node import ScaleAndBias, Attention, adj_connectivity
 import numpy as np
 
-class OmegaLayerOptimized(nn.Module):
+class OmegaModule(nn.Module):
     """
-    Handles the intrinsic frequency (omega) rotation dynamics.
+    [Optimized] Handles the intrinsic frequency (omega) rotation dynamics.
+    Vectorized implementation avoiding Python loops.
     """
     def __init__(self, n, ch, init_omg=0.1, global_omg=False, learn_omg=True):
         super().__init__()
@@ -17,51 +18,78 @@ class OmegaLayerOptimized(nn.Module):
         self.global_omg = global_omg
 
         if n % 2 != 0:
-            raise NotImplementedError("n must be even for OmegaLayer (pairwise oscillators).")
+            raise NotImplementedError("n must be even for OmegaModule (pairwise oscillators).")
 
-        # Pre-calculate parameter shape to avoid overhead in forward pass
-        # ch // 2 because we process (x, y) pairs.
+        # Parameter shape: (1, 1) or (Groups, 1)
         shape = (1, 1) if global_omg else (ch // 2, 1)
         
-        # Initialize omega parameters
-        self.omg_param = nn.Parameter(
+        self.omega_param = nn.Parameter(
             init_omg * (1 / np.sqrt(2)) * torch.ones(shape), 
             requires_grad=learn_omg
         )
 
     def forward(self, x):
         """
-        Applies rotation dynamics: dx/dt = omega * (-y, x)
         Input: x [B, N, C]
+        Returns: omega * (-y, x)
         """
         B, N, C = x.shape
         
         # 1. View as coordinate pairs: [B, N, Groups, 2]
-        # The last dimension '2' represents the (x, y) coordinates.
         x_pairs = x.view(B, N, C // 2, 2)
         
-        # 2. Get omega magnitude: [1, 1, Groups, 1] or [1, 1, 1, 1]
-        # Automatic broadcasting handles the expansion.
-        omg = torch.norm(self.omg_param, dim=-1, keepdim=True) 
+        # 2. Get omega magnitude
+        omg = torch.norm(self.omega_param, dim=-1, keepdim=True) 
         if not self.global_omg:
             omg = omg.view(1, 1, C // 2, 1)
 
         # 3. Apply Rotation: (-y, x) * omega
-        # x_pairs[..., 0] is x-coord, x_pairs[..., 1] is y-coord
-        # result 0:  omg * y
-        # result 1: -omg * x
         out = torch.empty_like(x_pairs)
         out[..., 0] =  omg * x_pairs[..., 1]
         out[..., 1] = -omg * x_pairs[..., 0]
         
-        # 4. Flatten back to original shape: [B, N, C]
         return out.view(B, N, C)
 
 
-class KMLayer(nn.Module):
+class SyncModule(nn.Module):
     """
-    Kuramoto Layer (KMLayer).
-    
+    [Optimized] Handles the Coupling / Synchronization logic.
+    Wraps GCN, Attention, or Dense Adjacency mechanisms.
+    """
+    def __init__(self, J, ch, heads=8, feature_dim=116):
+        super().__init__()
+        self.type = J
+        
+        if J == "conv":
+            self.net = GCNConv(ch, ch)
+        elif J == "attn":
+            self.net = Attention(ch, heads=heads, weight="fc")
+        elif J == "adj":
+            self.net = adj_connectivity(feature_dim)
+        else:
+            raise NotImplementedError(f"Unknown mapping_type/J: {J}")
+
+    def forward(self, x, graph_struct):
+        if self.type == "conv":
+            # GCNConv optimization for B=1
+            if x.dim() == 3 and x.size(0) == 1:
+                return self.net(x.squeeze(0), graph_struct).unsqueeze(0)
+            else:
+                raise NotImplementedError("Batch>1 optimization pending for GCNConv")
+        elif self.type == "adj":
+            # Dense Adjacency
+            if hasattr(self.net, 'update_latest_A_weighted'):
+                self.net.update_latest_A_weighted(graph_struct * self.net.weight)
+            return self.net(x, graph_struct)
+        else:
+            # Attention
+            return self.net(x)
+
+
+class Kuramoto_Solver(nn.Module):
+    """
+    [Optimized] Kuramoto Solver / KLayer.
+    Solves: dx/dt = proj( Omega(x) + Sync(x) + Control(y) )
     """
     def __init__(
         self,
@@ -78,170 +106,103 @@ class KMLayer(nn.Module):
         feature_dim=116,
     ):
         super().__init__()
-        assert (ch % n) == 0, "Channel dimension must be divisible by n (oscillator grouping)."
+        assert (ch % n) == 0, "Channel dimension must be divisible by n."
         self.n = n
         self.ch = ch
-        self.J = J
-        self.use_omega = use_omega
+        self.J_type = J
+        
+        # 1. Omega Module
+        self.omega_module = OmegaModule(n, ch, init_omg, global_omg, learn_omg) if use_omega else None
 
-        # --- Intrinsic Frequency (Omega) ---
-        self.omg = (
-            OmegaLayerOptimized(n, ch, init_omg, global_omg, learn_omg)
-            if self.use_omega
-            else None # Explicitly set to None for faster checking
-        )
+        # 2. Sync Module (Coupling)
+        self.sync_module = SyncModule(J, ch, heads, feature_dim)
 
-        # --- Coupling / Connectivity Function (J) ---
-        if J == "conv":
-            self.connectivity = GCNConv(ch, ch)
-        elif J == "attn":
-            self.connectivity = Attention(ch, heads=heads, weight="fc")
-        elif J == "adj":
-            self.connectivity = adj_connectivity(feature_dim)
-        else:
-            raise NotImplementedError(f"Unknown connectivity type: {J}")
-
-        # --- Normalization ---
+        # 3. Control Normalization (f_phi equivalent)
         if c_norm == "gn":
-            self.c_norm = nn.GroupNorm(ch // n, ch, affine=True)
+            self.norm_y = nn.GroupNorm(ch // n, ch, affine=True)
         elif c_norm == "sandb":
-            self.c_norm = ScaleAndBias(ch, token_input=False)
+            self.norm_y = ScaleAndBias(ch, token_input=False)
         else:
-            self.c_norm = nn.Identity()
+            self.norm_y = nn.Identity()
 
-    def normalize(self, x):
-        """
-        In-place renormalization to project oscillators back to the manifold (unit sphere).
-        Assumes x is [B, N, C].
-        Splits C into groups of size n and normalizes each group.
-        """
+    def map_to_sphere(self, x):
+        """Project x back to the unit sphere manifold (Renormalization)."""
         B, N, C = x.shape
-        # View: [B, N, Groups, n_dim]
         x_view = x.view(B, N, C // self.n, self.n)
-        
-        # Calculate L2 norm along the last dimension
         norm = torch.norm(x_view, p=2, dim=-1, keepdim=True)
-        
-        # Normalize (add epsilon for numerical stability)
         x_view = x_view / (norm + 1e-6)
-        
         return x_view.reshape(B, N, C)
 
-    def project_fast(self, y, x):
-        """
-        Projection into the tangent space.
-        Formula: y_proj = y - <x, y> * x
-        
-        Assumes x is already normalized (|x|=1).
-        """
+    def project_osc(self, vector, x):
+        """Project update vector onto the tangent space of x."""
         B, N, C = x.shape
-        
-        # 1. View as groups: [B, N, Groups, n_dim]
         x_v = x.view(B, N, C // self.n, self.n)
-        y_v = y.view(B, N, C // self.n, self.n)
-
-        # 2. Dot product (Similarity) along the n_dim axis
-        # sim: [B, N, Groups, 1]
-        sim = torch.sum(x_v * y_v, dim=-1, keepdim=True)
-
-        # 3. Subtract the parallel component
-        # out_v: [B, N, Groups, n_dim]
-        out_v = y_v - sim * x_v
+        vec_v = vector.view(B, N, C // self.n, self.n)
         
+        # Dot product <vector, x>
+        sim = torch.sum(x_v * vec_v, dim=-1, keepdim=True)
+        
+        # Subtract radial component: v - <v,x>x
+        out_v = vec_v - sim * x_v
         return out_v.reshape(B, N, C)
 
-    def kupdate(self, x, c, graph_struct):
-        """
-        Calculates the derivative dx/dt based on the Kuramoto model.
-        """
-        # 1. Coupling Term (Connectivity)
-        # Note: graph_struct is pre-computed outside the loop for efficiency
-        if self.J == "conv":
-            # x: [B, N, C] -> GCN needs [N, C] (assuming B=1) or stacked batch.
-            # Here we squeeze B=1 for efficiency.
-            if x.dim() == 3 and x.size(0) == 1:
-                _y = self.connectivity(x.squeeze(0), graph_struct).unsqueeze(0)
-            else:
-                # Fallback for B>1 (requires reshaped batch handling)
-                # For this specific project, B=1 is standard.
-                raise NotImplementedError("Optimization assumes Batch=1 for GCNConv")
-                
-        elif self.J == "adj":
-            # 'adj' connectivity typically requires dense matrix multiplication
-            A_weighted = graph_struct * self.connectivity.weight
-            
-            # Update internal weights if the module supports it (for visualization/losses)
-            if hasattr(self.connectivity, 'update_latest_A_weighted'):
-                self.connectivity.update_latest_A_weighted(A_weighted)
-                
-            _y = self.connectivity(x, graph_struct)
-        else:
-            # Attention or other methods handling x directly
-            _y = self.connectivity(x)
+    def surrounding_osc(self, x, y, graph_struct):
+        """Calculates external driving forces: Sync + Memory(y)"""
+        # 1. Sync / Coupling
+        coupling = self.sync_module(x, graph_struct)
+        # 2. Add Attending Memory (Control y)
+        return coupling + y
 
-        # 2. Add Control/Bias (Attending Memory)
-        y = _y + c
+    def update_osc(self, x, y, graph_struct):
+        """Calculates dxdt"""
+        # 1. Get driving force (Coupling + Control)
+        force = self.surrounding_osc(x, y, graph_struct)
 
-        # 3. Omega Term (Intrinsic Rotation)
-        if self.omg is not None:
-            omg_x = self.omg(x)
-        else:
-            omg_x = 0 # Scalar 0 allows broadcasting addition (faster than torch.zeros_like)
+        # 2. Intrinsic rotation
+        omega_term = self.omega_module(x) if self.omega_module else 0
 
-        # 4. Projection (Manifold Constraint)
-        # Project the update 'y' onto the tangent space of the oscillator manifold
-        y_proj = self.project_fast(y, x)
+        # 3. Tangent Projection (Constraint)
+        force_proj = self.project_osc(force, x)
 
-        # 5. Final Derivative
-        dxdt = omg_x + y_proj
+        # 4. Final derivative
+        dxdt = omega_term + force_proj
         return dxdt
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor, sc, Q: int, gamma):
+    def forward(self, x, y, sc, Q, gamma):
         """
-        ODE Solver Loop (Forward Euler).
-        
-        Args:
-            x: Oscillator state [B, C, N] (will be transposed internally)
-            y: Control pattern [B, C, N]
-            sc: Structural connectivity (dense adj or edge_index)
-            Q: Number of time steps
-            gamma: Step size / coupling strength
+        x: Oscillator state [B, C, N] (input) -> [B, N, C] (internal)
+        y: Control state    [B, C, N] (input) -> [B, N, C] (internal)
+        sc: Graph structure
+        Q: Steps
+        gamma: Step size
         """
-        # --- Pre-computation / Pre-processing ---
+        # --- Pre-processing ---
+        # Normalize y (Control)
+        y = self.norm_y(y)
         
-        # 1. Normalize shapes to [B, N, C] for efficient linear algebra
-        y = self.c_norm(c)
+        # Transpose to [B, N, C] for efficiency
         if y.shape[1] == self.ch: y = y.transpose(1, 2)
         if x.shape[1] == self.ch: x = x.transpose(1, 2)
-        
-        # 2. Prepare Graph Structure ONCE (Avoids CPU-GPU sync inside loop)
+
+        # Prepare Graph Structure (Once, outside loop)
         graph_struct = None
-        if self.J == "conv":
-            # For GCN: Dense Adj -> Sparse Edge Index
-            # Doing this once saves massive time compared to doing it inside kupdate
+        if self.J_type == "conv":
+            # Dense -> Sparse Edge Index
             graph_struct = torch.nonzero(sc.squeeze(), as_tuple=False).T
-        elif self.J == "adj":
-            # For Dense layers: Ensure Dense Adj
+        elif self.J_type == "adj":
+            # Ensure Dense
             graph_struct = to_dense_adj(sc).squeeze(0) if sc.dim() == 2 else sc.squeeze(0)
         
-        # 3. Initial Normalization
-        x = self.normalize(x)
-        
+        # Initial Map to Sphere
+        x = self.map_to_sphere(x)
         xs = []
-        
-        # --- ODE Solver Loop ---
+
+        # --- Dynamics Loop ---
         for _ in range(Q):
-            # Calculate derivative
-            dxdt = self.kupdate(x, y, graph_struct)
-            
-            # Euler Integration Step
+            dxdt = self.update_osc(x, y, graph_struct)
             x = x + gamma * dxdt
-            
-            # Renormalize to stay on the manifold
-            x = self.normalize(x)
-            
+            x = self.map_to_sphere(x)
             xs.append(x)
 
-        # Return trajectory list. 
-        # (Transposing back to [B, C, N] is usually handled by the parent class if needed)
+        # Return trajectory and dummy placeholders
         return xs, [], []
