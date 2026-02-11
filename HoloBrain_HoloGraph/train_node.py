@@ -1,200 +1,566 @@
-# train_brick_diffdata.py
 import argparse
 import os
-import random
-import time
+import logging
+import copy
 import numpy as np
 
 import torch
 import torch.nn as nn
 from torch import optim
 
-from torch_geometric.datasets import WebKB, Actor, WikipediaNetwork
-from torch_geometric.utils import to_dense_adj
+from source.training_utils import LinearWarmupScheduler
 
-from source.utils import LinearWarmupScheduler, compute_weighted_metrics, logger
-from accelerate import utils
-from source.brick import BRICK
+
+import accelerate
+from accelerate import Accelerator
+
+from torch_geometric.datasets import Planetoid
+from torch_geometric.datasets import WebKB, Actor, WikipediaNetwork, Planetoid
+from source.layers.common_layers_node import compute_weighted_metrics
+from source.models.net_node import HoloGraph
 from ema_pytorch import EMA
 
 
-def train_one_epoch(model, ema, optimizer, scheduler, data, train_mask, device, epoch, logger):
-    model.train()
-    epoch_loss = 0.0
+def create_logger(logging_dir: str):
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[\033[34m%(asctime)s\033[0m] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(f"{logging_dir}/log.txt"),
+        ],
+    )
+    logger = logging.getLogger(__name__)
+    return logger
+
+def str2bool(x):
+    if isinstance(x, bool):
+        return x
+    x = x.lower()
+    if x[0] in ["0", "n", "f"]:
+        return False
+    elif x[0] in ["1", "y", "t"]:
+        return True
+    raise ValueError("Invalid value: {}".format(x))
+
+def build_arg_parser():
+
     
-    criterion = nn.CrossEntropyLoss()
-    data = data.to(device)
-    inputs = data.x.unsqueeze(0)
-    adj = to_dense_adj(data.edge_index)[0]
-    if adj.dim() == 2:
-        adj = adj.unsqueeze(0)
-
-    outputs, x_feat, y_feat = model(inputs, adj)
-    outputs = outputs.squeeze(0)[train_mask]
-    targets = data.y.to(device)
-    if targets.dim() == 2:
-        targets = targets.squeeze(1)
-    targets = targets[train_mask]
-
-    loss = criterion(outputs, targets)
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    scheduler.step()
-    ema.update()
-
-    epoch_loss += loss.item()
-    logger.info(f"[Epoch {epoch+1}] Training Loss: {epoch_loss:.4f}")
-    return epoch_loss
-
-def evaluate(model, data, train_mask, val_mask, test_mask, device):
-    model.eval()
-    with torch.no_grad():
-        data = data.to(device)
-        inputs = data.x.unsqueeze(0) 
-        adj = to_dense_adj(data.edge_index)[0]
-        if adj.dim() == 2:
-            adj = adj.unsqueeze(0)
-        
-        outputs, x_feat, y_feat = model(inputs, adj)
-        outputs = outputs.squeeze(0)
-        targets = data.y.to(device)
-        if targets.dim() == 2:
-            targets = targets.squeeze(1)
-        
-        results = {}
-        for mask_type, mask in zip(["val", "test"], [val_mask, test_mask]):
-            preds = outputs[mask].argmax(dim=-1)
-            metrics = compute_weighted_metrics(preds, targets[mask])
-            results[mask_type] = {
-                "accuracy": metrics[0],
-                "precision": metrics[1],
-                "f1": metrics[3]
-            }
-    return results
-
-def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--gpu", type=str, default="0", help="GPU id to use")
+    # Training options
+    parser.add_argument("--gpu", type=str, default='0')
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--exp_name", type=str, help="expname")
     parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay factor")
+    parser.add_argument("--beta", type=float, default=0.999, help="ema decay")
+    parser.add_argument("--epochs", type=int, default=300, help="num of epochs")
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=50,
+        help="save checkpoint every specified epochs",
+    )
+    parser.add_argument("--lr", type=float, default=1e-3, help="lr")
+    parser.add_argument("--warmup_iters", type=int, default=20)
+    parser.add_argument(
+        "--finetune",
+        type=str,
+        default=None,
+        help="path to the checkpoint. Training starts from that checkpoint",
+    )
 
-    parser.add_argument("--epochs", type=int, default=300, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--warmup_iters", type=int, default=10)
-    parser.add_argument("--batchsize", type=int, default=256)  
+    # Data loading
+    parser.add_argument("--data", type=str, default="Cora")
+    parser.add_argument("--batchsize", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument(
+        "--data_imsize",
+        type=int,
+        default=None,
+        help="Image size. If None, use the default size of each dataset",
+    )
 
-    parser.add_argument("--data", type=str, default="Cornell", help="Dataset name")
-    parser.add_argument("--num_nodes", type=int, default=116, help="Number of nodes")
-    parser.add_argument("--feature_dim", type=int, default=39, help="Input feature dimension")
-    parser.add_argument("--num_class", type=int, default=4, help="Number of classes")
-    parser.add_argument("--L", type=int, default=1, help="Number of Kuramoto sovlers")
-    parser.add_argument("--h", type=int, default=256, help="Hidden dimension")
-    parser.add_argument("--T", type=int, default=8, help="Number of time steps")
-    parser.add_argument("--N", type=int, default=4, help="oscillator dimensions")
-    parser.add_argument("--beta", type=float, default=1.0, help="Beta for Kuramoto solver")
+    # General model options
+    parser.add_argument("--L", type=int, default=1, help="num of layers")
+    parser.add_argument("--ch", type=int, default=256, help="num of channels")
+    parser.add_argument(
+        "--imsize",
+        type=int,
+        default=None,
+        help=(
+            "Model's imsize. This is used when you want finetune a pretrained model "
+            "that was trained on images with different resolution than the finetune image dataset."
+        ),
+    )
+    parser.add_argument("--ksize", type=int, default=1, help="kernel size")
+    parser.add_argument("--Q", type=int, default=8, help="num of recurrence")
+    parser.add_argument("--num_class", type=int, default=6, help="num of class")
+    parser.add_argument("--feature_dim", type=int, default=None, help="num of channels of features")
+    parser.add_argument(
+        "--maxpool", type=str2bool, default=True, help="max pooling or avg pooling"
+    )
+    parser.add_argument(
+        "--heads", type=int, default=8, help="num of heads in self-attention"
+    )
+    parser.add_argument("--dropout", type=float, default=0.1, help="dropout rate")
 
-    parser.add_argument("--use_pe", action="store_false", help="Use positional encoding")
-    parser.add_argument("--node_cls", action="store_true", help="Node classification mode")
-    parser.add_argument("--y_type", type=str, default="linear", choices=["conv", "linear"], help="y computation type ")
-    parser.add_argument("--mapping_type", type=str, default="conv", choices=["conv", "gconv"], help="Mapping type for y")
-    parser.add_argument("--parcellation", action="store_false", help="Implement parcellation or not")
 
-    args = parser.parse_args()
+    parser.add_argument("--N", type=int, default=4, help="num of rotating dimensions")
+    parser.add_argument("--gamma", type=float, default=1.0, help="step size")
+    parser.add_argument("--J", type=str, default="attn", help="connectivity")
+    parser.add_argument("--use_omega", type=str2bool, default=False)
+    parser.add_argument("--global_omg", type=str2bool, default=False)
+    parser.add_argument(
+        "--c_norm",
+        type=str,
+        default="sandb",
+        help="normalization. gn(GroupNorm), sandb(scale and bias), or none",
+    )
+    parser.add_argument(
+        "--init_omg", type=float, default=0.01, help="initial omega length"
+    )
+    parser.add_argument("--learn_omg", type=str2bool, default=True)
+    parser.add_argument("--homo", type=str2bool, default=True)
 
-    utils.set_seed(args.seed)
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+    # Extra training options (from train_node1.py)
+    parser.add_argument("--weight_decay", type=float, default=5e-4, help="Weight decay factor")
+    parser.add_argument(
+        "--use_scheduler", type=str2bool, default=True, help="Use learning rate scheduler"
+    )
+    return parser
 
-    logger = logger()
-    logger.info("Init successfully")
+
+def run_planetoid_public(args, accelerator: Accelerator, device: torch.device):
+
+
+    datasets = {
+        "Cora": Planetoid(root="data/Planetoid", name="Cora", split="public"),
+        "Citeseer": Planetoid(root="data/Planetoid", name="Citeseer", split="public"),
+        "Pubmed": Planetoid(root="data/Planetoid", name="Pubmed", split="public"),
+    }
+
+    if args.data not in datasets:
+        raise ValueError(f"Dataset {args.data} is not a Planetoid public-split dataset")
+
+    dataset = datasets[args.data]
+    data = dataset[0].to(device)
+
+    def train_fn(net, ema, opt, scheduler, data, epoch, train_mask, val_mask, test_mask):
+        net.train()
+        running_loss = 0.0
+
+        inputs = data.x.T
+        sc = data.edge_index
+        target = data.y.squeeze()
+        inputs = inputs.unsqueeze(0) if inputs.dim() == 2 else inputs
+
+        outputs, x_fea, c_fea = net(inputs, sc, sc)
+
+        target = target.squeeze(1) if target.dim() == 2 else target
+
+        outputs_train = outputs.squeeze(0)[train_mask]
+        target_train = target[train_mask]
+
+        loss = nn.CrossEntropyLoss()(outputs_train, target_train.to(device))
+
+        opt.zero_grad()
+        accelerator.backward(loss)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+        opt.step()
+        if args.use_scheduler:
+            scheduler(epoch)
+        ema.update()
+
+        running_loss += loss.item()
+        return running_loss
+
+    def test_fn(net, data, train_mask, val_mask, test_mask):
+        net.eval()
+
+        inputs = data.x.T
+        sc = data.edge_index
+        inputs = inputs.unsqueeze(0) if inputs.dim() == 2 else inputs
+        target = data.y.squeeze()
+        target = target.squeeze(1) if target.dim() == 2 else target
+
+        outputs, _, _ = net(inputs, sc, sc)
+
+        results = {}
+        for mask_name, mask in zip(["val", "test"], [val_mask, test_mask]):
+            pred = outputs.squeeze(0)[mask].argmax(dim=-1)
+            gt = target[mask]
+            acc, pre, recall, f1 = compute_weighted_metrics(pred, gt)
+            results[mask_name] = {
+                "accuracy": acc,
+                "precision": pre,
+                "f1": f1,
+            }
+
+        return results, None, target
+
+    train_mask = data.train_mask
+    val_mask = data.val_mask
+    test_mask = data.test_mask
+
+    assert train_mask.dim() == 1, "Expected 1D mask for standard split"
+
+    if args.data == "Cora":
+        args.num_class = 7
+        args.feature_dim = data.x.shape[1]
+    elif args.data == "Citeseer":
+        args.num_class = 6
+        args.feature_dim = data.x.shape[1]
+    elif args.data == "Pubmed":
+        args.num_class = 3
+        args.feature_dim = data.x.shape[1]
+
+    print(f"Standard semi-supervised split:")
+    print(f"  Training nodes: {train_mask.sum().item()} ({train_mask.sum().item()/data.num_nodes*100:.2f}%)")
+    print(f"  Validation nodes: {val_mask.sum().item()} ({val_mask.sum().item()/data.num_nodes*100:.2f}%)")
+    print(f"  Test nodes: {test_mask.sum().item()} ({test_mask.sum().item()/data.num_nodes*100:.2f}%)")
+
+    print(
+        f"Dataset info - num_nodes: {data.x.shape[0]}, feature_dim: {data.x.shape[1]}, num_classes: {args.num_class}"
+    )
+    print(
+        f"Parameters: ch={args.ch}, L={args.L}, Q={args.Q}, gamma={args.gamma}, dropout={args.dropout}"
+    )
+
+    net = HoloGraph(
+        n=args.N,
+        ch=args.ch,
+        L=args.L,              
+        Q=args.Q,
+        gamma=args.gamma,
+        J=args.J,
+        use_omega=args.use_omega,
+        global_omg=args.global_omg,
+        c_norm=args.c_norm,
+        num_class=data.y.max().item() + 1, 
+        feature_dim=data.x.size(-1),        
+        dropout=args.dropout,
+        homo=True,
+
+        gst_level=1,           
+        gst_wavelet=(0,1,2),   
+
+        init_x_from="gst",    
+        fuse_y_into_x=False,  
+        pred_from="y",         
+    ).to(device)
+
+
+    total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    print(f"Total number of basemodel parameters: {total_params}")
+
+    if args.finetune:
+        logging.info("Loading checkpoint...")
+        state = torch.load(args.finetune, map_location=device)
+        net.load_state_dict(state["model_state_dict"])
+
+    optimizer = optim.AdamW(
+        net.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        eps=1e-8,
+    )
+
+    if args.finetune:
+        logging.info("Loading optimizer state...")
+        state = torch.load(args.finetune, map_location=device)
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.lr
+
+    ema = EMA(net, beta=0.995, update_every=1, update_after_step=50)
+
+    def lr_scheduler(epoch):
+        if epoch < args.warmup_iters:
+            lr_scale = min(1.0, (epoch + 1) / args.warmup_iters)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.lr * lr_scale
+        else:
+            import numpy as np
+
+            decay_factor = 0.5 * (
+                1
+                + np.cos(
+                    np.pi * (epoch - args.warmup_iters)
+                    / (args.epochs - args.warmup_iters)
+                )
+            )
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.lr * decay_factor
+
+    best_val_metrics = None
+    best_test_metrics = None
+    best_val_epoch = 0
+
+    all_epochs = []
+    all_val_accs = []
+    all_test_accs = []
+
+    best_test_acc_overall = 0
+    best_test_epoch_overall = 0
+
+    best_val_state_dict = None
+    best_test_state_dict = None
+
+    log_interval = 10 if args.epochs > 100 else 5
+
+    for epoch in range(0, args.epochs):
+        loss = train_fn(
+            net, ema, optimizer, lr_scheduler, data, epoch, train_mask, val_mask, test_mask
+        )
+        results, _, _ = test_fn(net, data, train_mask, val_mask, test_mask)
+
+        all_epochs.append(epoch + 1)
+        all_val_accs.append(results["val"]["accuracy"])
+        all_test_accs.append(results["test"]["accuracy"])
+
+        if best_val_metrics is None or results["val"]["accuracy"] > best_val_metrics["accuracy"]:
+            best_val_metrics = results["val"].copy()
+            best_test_metrics = results["test"].copy()
+            best_val_epoch = epoch + 1
+            best_val_state_dict = copy.deepcopy(net.state_dict())
+
+        if results["test"]["accuracy"] > best_test_acc_overall:
+            best_test_acc_overall = results["test"]["accuracy"]
+            best_test_epoch_overall = epoch + 1
+            best_test_state_dict = copy.deepcopy(net.state_dict())
+
+        if (epoch + 1) % log_interval == 0 or epoch == 0 or epoch == args.epochs - 1:
+            print(
+                f"Epoch {epoch + 1:03d}, Loss: {loss:.4f}, "
+                f"Val Acc: {results['val']['accuracy']:.4f}, "
+                f"Test Acc: {results['test']['accuracy']:.4f}, "
+                f"Test Pre: {results['test']['precision']:.4f}, "
+                f"Test F1: {results['test']['f1']:.4f}, "
+                f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+            )
+
+    print("\n" + "=" * 80)
+    print(f"Best test accuracy: {best_test_acc_overall:.4f} (Epoch {best_test_epoch_overall})")
+    print(f"Acc at best validation: {best_test_metrics['accuracy']:.4f} (Epoch {best_val_epoch})")
+    print(f"F1 at best validation: {best_test_metrics['f1']:.4f}")
+    print(f"Precision at best validation: {best_test_metrics['precision']:.4f}")
+    print("=" * 80)
+
+
+def run_heterophilic(args, accelerator: Accelerator, device: torch.device): 
 
     datasets = {
         "Cornell": WebKB(root="data/Cornell", name="Cornell"),
         "Texas": WebKB(root="data/Texas", name="Texas"),
         "Wisconsin": WebKB(root="data/Wisconsin", name="Wisconsin"),
-        "Chameleon": WikipediaNetwork(root="data/Chameleon", name="Chameleon"),
-        "Squirrel": WikipediaNetwork(root="data/Squirrel", name="Squirrel"),
         "Actor": Actor(root="data/Actor"),
+        "Cora_geom": Planetoid(root="data/Cora", name="Cora", split="geom-gcn"),
+        "Citeseer_geom": Planetoid(root="data/Citeseer", name="Citeseer", split="geom-gcn"),
     }
+
     if args.data not in datasets:
-        raise ValueError(f"Dataset {args.data} not supported. Available: {list(datasets.keys())}")
+        raise ValueError(f"Dataset {args.data} is not supported in heterophilic branch")
 
-    logger.info(f"Running on dataset {args.data} ...")
-    dataset_obj = datasets[args.data]
-    data = dataset_obj[0]  
-    data = data.to(device)
+    dataset = datasets[args.data].to(device)
 
-    metrics_summary = {"accuracy": [], "precision": [], "f1": []}
+    metrics = {"accuracy": [], "precision": [], "f1": []}
 
-    num_splits = data.train_mask.shape[1] if hasattr(data, "train_mask") else 1
-    for split_idx in range(num_splits):
-        logger.info(f"Split {split_idx}:")
-        train_mask = data.train_mask[:, split_idx]
-        val_mask = data.val_mask[:, split_idx]
-        test_mask = data.test_mask[:, split_idx]
+    data0 = dataset[0]
+    num_classes = dataset.num_classes if hasattr(dataset, "num_classes") else int(data0.y.max().item() + 1)
+    num_features = dataset.num_features if hasattr(dataset, "num_features") else data0.x.size(1)
 
-        model_imsize = data.num_features if args.model_imsize is None else args.model_imsize
-        net = BRICK(
-            N=args.N,
-            hidden_dim=args.h,
-            L=args.L,
-            T=args.T,
-            num_class=args.num_class,
-            beta=args.beta,  
-            feature_dim=args.feature_dim,
-            num_nodes=args.num_nodes,
-            use_pe=args.use_pe,
-            node_cls=args.node_cls,
-            y_type=args.y_type,
-            mapping_type=args.mapping_type,
-        ).to(device)
+    if args.feature_dim is None or args.feature_dim <= 0:
+        args.feature_dim = data0.num_nodes
+    if args.imsize is None or args.imsize <= 0:
+        args.imsize = num_features
+    args.num_class = num_classes
+    print("args.feature_dim: ", args.feature_dim)
 
-        total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
-        logger.info(f"Total trainable parameters: {total_params:,}")
+    print(
+        f"Dataset {args.data}: num_nodes={data0.num_nodes}, feature_dim={num_features}, num_classes={num_classes}"
+    )
 
-        optimizer = optim.Adam(net.parameters(), lr=args.lr, weight_decay=0.0001)
+    def make_model():
+        return HoloGraph(
+        n=args.N,
+        ch=args.ch,
+        L=args.L,              
+        Q=args.Q,
+        gamma=args.gamma,
+        J=args.J,
+        use_omega=args.use_omega,
+        global_omg=args.global_omg,
+        c_norm=args.c_norm,
+        num_class=data.y.max().item() + 1, 
+        feature_dim=data.x.size(-1),        
+        dropout=args.dropout,
+        homo=False,
+
+        gst_level=1,           
+        gst_wavelet=(0,1,2),   
+
+        init_x_from="gst",    
+        fuse_y_into_x=False,  
+        pred_from="y",         
+    ).to(device)
+
+    def build_optimizer(model):
+        return optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+    data = dataset[0]
+    if data.train_mask.dim() == 2 and data.train_mask.size(1) == 10:
+        split_range = range(10)
+    else:
+        split_range = range(1)
+
+    for split_idx in split_range:
+        if data.train_mask.dim() == 2:
+            train_mask = data.train_mask[:, split_idx]
+            val_mask = data.val_mask[:, split_idx]
+            test_mask = data.test_mask[:, split_idx]
+        else:
+            train_mask = data.train_mask
+            val_mask = data.val_mask
+            test_mask = data.test_mask
+
+        net = make_model()
+        optimizer = build_optimizer(net)
+        # ema = EMA(net, beta=args.beta, update_every=10, update_after_step=100)
         scheduler = LinearWarmupScheduler(optimizer, warmup_iters=args.warmup_iters)
-        ema = EMA(net, beta=args.ema_decay, update_every=10, update_after_step=200)
+
+        print("params: ", sum(p.numel() for p in net.parameters() if p.requires_grad))
+
+        def train_once(epoch):
+            net.train()
+            running_loss = 0.0
+
+            d = data.to(device)
+            inputs = d.x.T
+            sc = d.edge_index
+            target = d.y
+
+            inputs = inputs.unsqueeze(0) if inputs.dim() == 2 else inputs
+
+            outputs, x_fea, c_fea = net(inputs, sc, sc)
+
+            target_ = target.squeeze(1) if target.dim() == 2 else target
+            target_ = target_[train_mask]
+            outputs_ = outputs.squeeze(0)[train_mask]
+
+            loss = nn.CrossEntropyLoss(label_smoothing=0.1)(outputs_, target_.to(device))
+            # loss = nn.CrossEntropyLoss()(outputs_, target_.to(device))
+
+            optimizer.zero_grad()
+            accelerator.backward(loss)
+            optimizer.step()
+            if args.use_scheduler:
+                scheduler.step()
+
+            # ema.update()
+            running_loss += loss.item()
+            return running_loss
+
+        def eval_once():
+            net.eval()
+            d = data.to(device)
+            inputs = d.x.T
+            sc = d.edge_index
+            inputs = inputs.unsqueeze(0) if inputs.dim() == 2 else inputs
+            target = d.y
+            target = target.squeeze(1) if target.dim() == 2 else target
+
+            outputs, _, _ = net(inputs, sc, sc)
+            outputs = outputs.squeeze(0)
+
+            results = {}
+            for mask_name, mask in zip(["val", "test"], [val_mask, test_mask]):
+                preds = outputs[mask].argmax(dim=-1)
+                gt = target[mask]
+                acc, pre, rec, f1 = compute_weighted_metrics(preds, gt)
+                results[mask_name] = {
+                    "accuracy": acc,
+                    "precision": pre,
+                    "f1": f1,
+                }
+            return results
 
         best_val_metrics = None
         best_test_metrics = None
 
         for epoch in range(args.epochs):
-            loss = train_one_epoch(net, ema, optimizer, scheduler, data, train_mask, device, epoch, logger)
-            t0 = time.time()
-            results = evaluate(net, data, train_mask, val_mask, test_mask, device)
-            elapsed_ms = (time.time() - t0) * 1000
+            loss = train_once(epoch)
+            results = eval_once()
+
             if best_val_metrics is None or results["val"]["accuracy"] > best_val_metrics["accuracy"]:
                 best_val_metrics = results["val"]
                 best_test_metrics = results["test"]
 
-            if (epoch + 1) % 20 == 0:
-                logger.info(
-                    f"Epoch {epoch+1:03d}, Loss: {loss:.4f}, Val Acc: {results['val']['accuracy']:.4f}, "
+            if (epoch + 1) % 10 == 0:
+                print(
+                    f"[split {split_idx}] Epoch {epoch + 1:03d}, Loss: {loss:.4f}, "
+                    f"Val Acc: {results['val']['accuracy']:.4f}, "
                     f"Test Acc: {results['test']['accuracy']:.4f}, "
-                    f"Test Pre: {results['test']['precision']:.4f}, Test F1: {results['test']['f1']:.4f} "
-                    f"(Inference time: {elapsed_ms:.2f} ms)"
+                    f"Test Pre: {results['test']['precision']:.4f}, "
+                    f"Test F1: {results['test']['f1']:.4f}"
                 )
 
-        metrics_summary["accuracy"].append(best_test_metrics["accuracy"])
-        metrics_summary["precision"].append(best_test_metrics["precision"])
-        metrics_summary["f1"].append(best_test_metrics["f1"])
-        logger.info(f"Best Test Metrics for split {split_idx+1}: {best_test_metrics}")
+        print(f"Best Test Metrics for split {split_idx}: {best_test_metrics}")
+        metrics["accuracy"].append(best_test_metrics["accuracy"])
+        metrics["precision"].append(best_test_metrics["precision"])
+        metrics["f1"].append(best_test_metrics["f1"])
 
-    avg_acc = np.mean(metrics_summary["accuracy"])
-    avg_pre = np.mean(metrics_summary["precision"])
-    avg_f1 = np.mean(metrics_summary["f1"])
-    logger.info(f"Final Results -- Average Test Acc: {avg_acc:.4f}, Precision: {avg_pre:.4f}, F1: {avg_f1:.4f}")
-    logger.info(f"All splits Accuracies: {metrics_summary['accuracy']}")
-    logger.info(f"All splits Precisions: {metrics_summary['precision']}")
-    logger.info(f"All splits F1 scores: {metrics_summary['f1']}")
+    for metric in metrics:
+        mean = np.mean(metrics[metric])
+        std = np.std(metrics[metric])
+        print(f"{metric.capitalize()} - Mean: {mean:.4f}, Std: {std:.4f}")
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.enable_flash_sdp(enabled=True)
+
+    accelerator = Accelerator()
+    device = torch.device(
+        "cuda:" + args.gpu if torch.cuda.is_available() else "cpu"
+    )
+    accelerate.utils.set_seed(args.seed + accelerator.process_index)
+
+    jobdir = f"runs/{args.exp_name}/"
+    if accelerator.is_main_process:
+        if not os.path.exists(jobdir):
+            os.makedirs(jobdir)
+        create_logger(jobdir)
+
+
+    planetoid_public = {"Cora", "Citeseer", "Pubmed"}
+    heterophilic = {
+        "Cornell",
+        "Texas",
+        "Wisconsin",
+        "Actor",
+    }
+
+    if args.data in planetoid_public:
+        run_planetoid_public(args, accelerator, device)
+    elif args.data in heterophilic:
+        run_heterophilic(args, accelerator, device)
+    else:
+        raise ValueError(
+            f"Unsupported dataset '{args.data}'. "
+            f"Planetoid branch: {sorted(planetoid_public)}, "
+            f"Heterophilic branch: {sorted(heterophilic)}"
+        )
+
 
 if __name__ == "__main__":
     main()
+
