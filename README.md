@@ -1,4 +1,3 @@
-## Explore Brain-Inspired Machine Intelligence for Connecting Dots on Graphs Through Holographic Blueprint of Oscillatory Synchronization
 ## From HoloBrain to HoloGraph: A Very First Step to Explore Machine Intelligence for Connecting Dots on Graphs
 
 ```plaintext
@@ -8,10 +7,11 @@ HoloBrain_HoloGraph/
  │   ├─ data/
  │   │   ├─ create_dataset.py    
  │   │   └─ dataset.py            # Data loading for different brain data
- │   ├─ modules/
+ │   ├─ layers/
  │   │   ├─ GST.py                # GST module (Graph Sattering Transform)
- │   │   └─ kuramoto_solver.py    # Kuramoto solver for oscillator synchronization
- │   ├─ brick.py                  # The main BRICK model (HoloBrain and HoloGraph)
+ │   │   └─ kurmotorlayer.py    # Kuramoto solver for oscillator synchronization
+ │   ├─ layers/
+ │       ├─ net_node.py                  # The main HoloGraph model
  │   └─ utils.py                  
  ├─ train_brain.py                # Script for brain data
  ├─ train_cluster.py              # Script for unsupervised clustering
@@ -59,7 +59,7 @@ dataset = create_dataset(args.data)
 ```
 
 * Supported datasets are defined in your `create_dataset` implementation.
-* Example: `"HCP-YA"`.
+* Example: `"Cora"`, `"Wisconsin"`,`"HCP-YA"`.
 * Each dataset must yield tuples of the form:
 
   ```python
@@ -69,6 +69,40 @@ dataset = create_dataset(args.data)
 ---
 
 ## 🚀 Running
+
+### Homophilic graphs (e.g., Cora)
+
+For homophilic graphs such as the Planetoid dataset Cora, you can run:
+
+```bash
+python train_node_merged.py \
+  --data Cora \
+  --lr 0.0005 \
+  --ch 1024 \
+  --Q 8 \
+  --homo True \
+  --L 3 \
+  --weight_decay 0.01 \
+  --dropout 0.5 \
+  --use_scheduler False
+```
+
+### Heterophilic graphs (e.g., Wisconsin)
+
+For heterophilic graphs, you can run:
+
+```bash
+python train_node_merged.py \
+  --data Wisconsin \
+  --lr 0.001 \
+  --ch 256 \
+  --Q 12 \
+  --homo False \
+  --L 1 \
+  --weight_decay 0.001 \
+  --dropout 0.5 \
+  --use_scheduler False
+```
 
 ### Single-GPU / CPU
 
@@ -116,4 +150,4 @@ At the end of training:
 * **Best metrics per fold** are logged.
 * **Average results across folds** are reported.
 
-
+---
