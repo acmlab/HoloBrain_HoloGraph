@@ -7,10 +7,11 @@ HoloBrain_HoloGraph/
  │   ├─ data/
  │   │   ├─ create_dataset.py    
  │   │   └─ dataset.py            # Data loading for different brain data
- │   ├─ modules/
+ │   ├─ layers/
  │   │   ├─ GST.py                # GST module (Graph Sattering Transform)
- │   │   └─ kuramoto_solver.py    # Kuramoto solver for oscillator synchronization
- │   ├─ brick.py                  # The main BRICK model
+ │   │   └─ kurmotorlayer.py    # Kuramoto solver for oscillator synchronization
+ │   ├─ layers/
+ │       ├─ net_node.py                  # The main HoloGraph model
  │   └─ utils.py                  
  ├─ train_brain.py                # Script for brain data
  ├─ train_cluster.py              # Script for unsupervised clustering
