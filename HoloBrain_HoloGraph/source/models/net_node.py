@@ -4,14 +4,14 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_dense_adj
 
-from source.layers.kurmotorlayer import KMLayer
+from source.layers.kurmotolayer import Kuramoto_Solver
 from source.layers.common_layers_node import ReadOutConv, MultiConv1D
 from source.layers.GST import Wavelet
 
 
 class HoloGraph(nn.Module):
     """
-    HoloGraph/HoloBrain: Physics-Informed Graph Neural Network with Kuramoto Dynamics.
+    HoloGraph: Physics-Informed Graph Neural Network with Kuramoto Dynamics.
 
     This architecture integrates Geometric Scattering Transforms (GST) with coupled oscillator dynamics 
     to capture both multi-scale structural features and long-range dependencies.
@@ -136,7 +136,7 @@ class HoloGraph(nn.Module):
         # ---------------------------------------------------------
         self.layers = nn.ModuleList()
         for l in range(self.L):
-            klayer = KMLayer(
+            klayer = Kuramoto_Solver(
                 n=n,
                 ch=ch,
                 J=self.J[l],
@@ -296,7 +296,7 @@ class HoloGraph(nn.Module):
             graph_struct = edge_index
 
         # -----------------------------
-        # Branch 2: Non-Homophilic
+        # Branch 2: Non-Homophilic 
         # -----------------------------
         else:
             # Infer topology (Edge Index or Dense Adj)
@@ -384,3 +384,313 @@ class HoloGraph(nn.Module):
         if return_features:
             return ret, x_state, saved_y, pre_ode, post_ode
         return ret, x_state, saved_y
+
+
+class HoloBrain(nn.Module):
+    """
+    HoloBrain: Physics-Informed Graph Neural Network for Graph Classification (e.g., Brain Networks).
+
+    Architecture:
+      1. Attending Memory (c): Uses MultiConv1D to encode spatiotemporal features.
+      2. Oscillator Init (x0): Uses GST (Eq. 4) to capture multi-scale structural frequencies.
+      3. Dynamics (KMLayer): Evolves oscillators using Kuramoto dynamics (Eq. 6).
+      4. Graph Head: Global Pooling -> MLP for graph-level prediction.
+
+    Input Constraints:
+      - feature_dim: MUST be provided (time series length).
+      - input_sc: Can be dense adjacency [B,N,N] or edge_index [2,E].
+    """
+
+    def __init__(
+        self,
+        n=4,
+        ch=256,
+        L=1,
+        Q=8,                        
+        num_class=2,                
+        feature_dim=None,           
+        J="attn",
+        ksize=1,
+        c_norm="gn",
+        gamma=1.0,
+        use_omega=False,
+        init_omg=1.0,
+        global_omg=False,
+        heads=8,
+        dropout=0.5,
+        use_residual=True,
+        learn_omg=False,
+        homo=False,                 # Usually False for Brain networks
+
+        # GST Hyperparams
+        gst_level=2,
+        gst_wavelet=(0, 1, 2),
+        probe_nodes=16,
+
+        # Architecture Switches
+        gst_total=4,                # Width multiplier for Control Encoder
+        pool="max",                 # Graph pooling: "max" or "avg"
+        pred_from="x",              # "x" (Final State) or "c" (Control Pattern)
+        fuse_y_into_x=False,        # Plan A: x = x0 + alpha * c
+        init_x_from="gst",          # "gst" (Strict Paper) or "c" (Stability)
+    ):
+        super().__init__()
+
+        if feature_dim is None:
+            raise ValueError("HoloBrain requires 'feature_dim' (e.g., time series length).")
+
+        self.n = n
+        self.ch = ch
+        self.L = int(L)
+        
+        self.steps = [int(Q)] * self.L if isinstance(Q, int) else [int(q) for q in Q]
+        
+        self.J = [J] * self.L if isinstance(J, str) else list(J)
+        self.gamma = float(gamma)
+        self.num_class = int(num_class)
+        self.homo = bool(homo)
+        self.use_residual = bool(use_residual)
+        self.dropout = nn.Dropout(p=float(dropout))
+
+        self.input_dim = int(feature_dim)  
+        self.gst_total = int(gst_total)
+        self.pred_from = pred_from
+        self.fuse_y_into_x = bool(fuse_y_into_x)
+        self.init_x_from = init_x_from
+
+        # -------------------------
+        # 1. Control Encoder -> c
+        # -------------------------
+        if self.homo:
+            # GCN path (Rare for brain graphs, but kept for compatibility)
+            self.c_gcn1 = GCNConv(self.input_dim, ch)
+            self.c_gcn2 = GCNConv(ch, ch)
+            self.c_norm1 = nn.LayerNorm(ch)
+            self.c_norm2 = nn.LayerNorm(ch)
+        else:
+            # Multi-Scale 1D Conv (Standard for Brain)
+            # Expects input [B, T, N] -> encodes temporal/feature dim
+            self.c_conv = MultiConv1D(
+                in_channels=self.input_dim,
+                out_channels=self.input_dim,
+                num_convs=self.gst_total,
+            )
+            self.c_proj = nn.Conv1d(self.input_dim * self.gst_total, ch, kernel_size=1)
+
+        # -------------------------
+        # 2. GST -> x0 (Eq. 4)
+        # -------------------------
+        self.gst = Wavelet(wavelet=list(gst_wavelet), level=int(gst_level))
+
+        # Probe Output Dimension
+        with torch.no_grad():
+            Np = max(int(probe_nodes), 2)
+            x_probe = torch.zeros(1, self.input_dim, Np)   # [1, T, N]
+            adj_probe = torch.eye(Np).unsqueeze(0)         # [1, N, N]
+            out = self.gst(x_probe, adj_probe)             # [1, N, T, dim]
+            
+            if out.dim() != 4:
+                raise RuntimeError(f"GST Output Error: Expected [B,N,T,dim], got {tuple(out.shape)}")
+            
+            gst_channels = int(out.size(-2) * out.size(-1)) # T * dim
+
+        self.patchfy_x = nn.Conv1d(gst_channels, ch, kernel_size=1)
+
+        if self.fuse_y_into_x:
+            self.alpha = nn.Parameter(torch.tensor(0.0))
+
+        # -------------------------
+        # 3. Dynamics (Kuramoto)
+        # -------------------------
+        self.layers = nn.ModuleList()
+        for l in range(self.L):
+            kblock = KMLayer(
+                n=n, ch=ch, J=self.J[l], c_norm=c_norm, use_omega=use_omega,
+                init_omg=init_omg, global_omg=global_omg, heads=heads,
+                learn_omg=learn_omg, ksize=ksize, feature_dim=self.input_dim,
+            )
+            # ReadOutConv applies inter-block transition
+            ro = ReadOutConv(ch, ch, self.n, 1, 1, 0, self.homo)
+            self.layers.append(nn.ModuleList([kblock, ro]))
+
+        # -------------------------
+        # 4. Graph Classification Head
+        # -------------------------
+        # Pooling: Aggregate Node Embeddings -> Graph Embedding
+        if pool == "max":
+            self.pool = nn.AdaptiveMaxPool1d(1)
+        elif pool == "avg":
+            self.pool = nn.AdaptiveAvgPool1d(1)
+        else:
+            raise ValueError("pool must be 'max' or 'avg'")
+
+        # MLP Head
+        self.graph_head = nn.Sequential(
+            nn.Linear(ch, 4 * ch),
+            nn.ReLU(),
+            nn.Dropout(p=float(dropout)),
+            nn.Linear(4 * ch, self.num_class),
+        )
+
+    # ============================================================
+    # Helpers
+    # ============================================================
+    def _infer_N(self, x):
+        """Infer Number of Nodes (N)."""
+        if x.dim() == 3:
+            # If dim 1 is input_dim, N is dim 2 (e.g., [B, F, N])
+            if x.size(1) == self.input_dim: return x.size(2)
+            # If dim 2 is input_dim, N is dim 1 (e.g., [B, N, F])
+            if x.size(2) == self.input_dim: return x.size(1)
+        if x.dim() == 2: return x.size(0)
+        raise ValueError(f"Cannot infer N from x shape {tuple(x.shape)}")
+
+    def _to_BTN(self, x, N=None):
+        """Normalize input to [B, T, N] where T=feature_dim."""
+        if x.dim() == 2: # [N, F] -> [1, F, N]
+            if x.size(1) != self.input_dim: raise ValueError(f"Dim mismatch F={self.input_dim}")
+            return x.t().unsqueeze(0).contiguous()
+        
+        if x.dim() == 3:
+            # [B, T, N]
+            if x.size(1) == self.input_dim: return x.contiguous()
+            # [B, N, T] -> [B, T, N]
+            if x.size(2) == self.input_dim: return x.transpose(1, 2).contiguous()
+            
+        raise ValueError(f"Cannot convert x={tuple(x.shape)} to [B, T, N]")
+
+    def _to_x_gcn(self, x, edge_index):
+        """Normalize input for GCN [N, F]."""
+        N = int(edge_index.max().item()) + 1
+        if x.dim() == 2: return x.contiguous(), N
+        if x.dim() == 3: return x.squeeze(0).contiguous(), N # Assumes B=1 for homo
+        return x, N
+
+    def _ensure_dense_adj(self, sc, N):
+        """Ensure adjacency is dense [B, N, N]."""
+        if sc.dim() == 2 and sc.size(0) == 2: # Edge Index
+            return to_dense_adj(sc.long(), max_num_nodes=N)
+        if sc.dim() == 2: return sc.unsqueeze(0).contiguous()
+        if sc.dim() == 3: return sc.contiguous()
+        raise ValueError(f"Unexpected adj shape: {tuple(sc.shape)}")
+
+    def _flatten_gst(self, out):
+        B, N, T, dim = out.shape
+        return out.reshape(B, N, T * dim)
+
+    def _multiconv_to_BCN(self, y_raw, N):
+        """Handle MultiConv1D output variations."""
+        if y_raw.dim() == 3:
+            if y_raw.size(2) == N: return y_raw.contiguous()
+            return y_raw.transpose(1, 2).contiguous()
+        
+        if y_raw.dim() == 4:
+            # [B, N, T, K] -> [B, T*K, N]
+            if y_raw.size(1) == N: 
+                B, _, T, K = y_raw.shape
+                y = y_raw.permute(0, 2, 3, 1).contiguous()
+                return y.view(B, T * K, N).contiguous()
+            if y_raw.size(2) == N:
+                B, T, _, K = y_raw.shape
+                y = y_raw.permute(0, 1, 3, 2).contiguous()
+                return y.view(B, T * K, N).contiguous()
+                
+        raise RuntimeError(f"Unexpected MultiConv output: {tuple(y_raw.shape)}")
+
+    # ============================================================
+    # Forward Pass
+    # ============================================================
+    def feature(self, inp, sc):
+        # Infer N and topology
+        N = self._infer_N(inp)
+        
+        if self.homo:
+            # Homo branch (Legacy support)
+            edge_index = sc
+            W = to_dense_adj(edge_index.long(), max_num_nodes=N)
+            x_btn = self._to_BTN(inp, N=N)
+            
+            x_gcn, _ = self._to_x_gcn(inp, edge_index)
+            c = self.c_gcn1(x_gcn, edge_index)
+            c = self.c_norm1(c)
+            c = F.relu(c)
+            c = self.dropout(c)
+            
+            c = self.c_gcn2(c, edge_index)
+            c = self.c_norm2(c)
+            c = F.relu(c)
+            c = self.dropout(c)
+            c = c.t().unsqueeze(0) # [1, ch, N]
+            
+            graph_struct = edge_index
+        else:
+            # Brain branch (Standard)
+            W = self._ensure_dense_adj(sc, N) # [B, N, N]
+            graph_struct = W
+            x_btn = self._to_BTN(inp, N=N)    # [B, T, N]
+
+            # Control Pattern c via MultiConv
+            c_raw = self.c_conv(x_btn)
+            c_bcn = self._multiconv_to_BCN(c_raw, N)
+            c = self.c_proj(c_bcn)            # [B, ch, N]
+            c = self.dropout(c)
+
+        # Oscillator Init x0 via GST
+        gst_out = self.gst(x_btn, W)          # [B, N, T, dim]
+        gst_flat = self._flatten_gst(gst_out)
+        x0 = self.patchfy_x(gst_flat.transpose(1, 2))
+
+        # Initialization Strategy
+        if self.init_x_from == "c":
+            x = c.clone()
+        else:
+            x = x0
+
+        if self.fuse_y_into_x:
+            x = x + self.alpha * c
+
+        saved_c = c.clone()
+        pre_ode = x.detach()
+
+        # Dynamics Evolution
+        xs, es = [], []
+        for i, (kblock, ro) in enumerate(self.layers):
+            _xs, _es, _ = kblock(x, c, graph_struct, T=self.steps[i], gamma=self.gamma)
+            x = _xs[-1]
+            x = ro(x, graph_struct)
+            xs.append(_xs)
+            es.append(_es)
+
+        post_ode = x.detach()
+        return c, x, xs, es, saved_c, pre_ode, post_ode
+
+    def forward(self, input, input_fc, input_sc, return_xs=False, return_es=False, return_features=False):
+        """
+        Args:
+            input: Node features [B, N, F] or [B, F, N]
+            input_sc: Adjacency [B, N, N]
+        Returns:
+            logits: [B, num_class]
+        """
+        c, x, xs, es, saved_c, pre_ode, post_ode = self.feature(input, input_sc)
+
+        # Graph Classification Logic
+        # 1. Choose Embedding
+        node_emb = x if self.pred_from == "x" else c  # [B, ch, N]
+        
+        # 2. Global Pooling [B, ch, N] -> [B, ch, 1]
+        g = self.pool(node_emb).squeeze(-1)           # [B, ch]
+        
+        # 3. MLP Classifier -> [B, num_class]
+        logits = self.graph_head(g)
+
+        if not (return_xs or return_es or return_features):
+            return logits, x, saved_c
+
+        ret = [logits]
+        if return_xs: ret.append(xs)
+        if return_es: ret.append(es)
+
+        if return_features:
+            return ret, x, saved_c, pre_ode, post_ode
+        return ret, x, saved_c
