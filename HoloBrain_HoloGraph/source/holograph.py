@@ -13,7 +13,6 @@ class HoloGraph(nn.Module):
     """
     HoloGraph: Physics-Informed Graph Neural Network.
     
-    Theoretical Alignment:
       1. Attending Memory 'y' (Control Pattern): Encodes structural/feature context.
       2. Initialization 'x(0)' [Eq. 4]: Generated via Geometric Scattering Transform (GST).
       3. Dynamics [Eq. 6]: Evolved via Kuramoto Dynamics for Q steps.
