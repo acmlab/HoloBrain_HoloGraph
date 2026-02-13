@@ -6,7 +6,7 @@ from torch_geometric.utils import to_dense_adj
 
 from source.modules.kuramoto_layer import Kuramoto_Solver
 
-from source.modules.common_layers_node import ReadOutConv, MultiConv1D
+from source.utils import ReadOutConv, MultiConv1D
 from source.modules.GST import GSTWavelet
 
 class HoloGraph(nn.Module):
