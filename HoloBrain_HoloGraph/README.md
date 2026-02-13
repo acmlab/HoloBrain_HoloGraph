@@ -7,11 +7,10 @@ HoloBrain_HoloGraph/
  │   ├─ data/
  │   │   ├─ create_dataset.py    
  │   │   └─ dataset.py            # Data loading for different brain data
- │   ├─ layers/
+ │   ├─ modules/
  │   │   ├─ GST.py                # GST module (Graph Sattering Transform)
- │   │   └─ kurmotorlayer.py    # Kuramoto solver for oscillator synchronization
- │   ├─ layers/
- │       ├─ net_node.py                  # The main HoloGraph model
+ │   │   └─ kuramoto_layer.py    # Kuramoto solver for oscillator synchronization
+ │   ├─ holograph.py                  # The main HoloGraph model
  │   └─ utils.py                  
  ├─ train_brain.py                # Script for brain data
  ├─ train_cluster.py              # Script for unsupervised clustering
@@ -75,7 +74,7 @@ dataset = create_dataset(args.data)
 For homophilic graphs such as the Planetoid dataset Cora, you can run:
 
 ```bash
-python train_node_merged.py \
+python train_node.py \
   --data Cora \
   --lr 0.0005 \
   --ch 1024 \
@@ -92,7 +91,7 @@ python train_node_merged.py \
 For heterophilic graphs, you can run:
 
 ```bash
-python train_node_merged.py \
+python train_node.py \
   --data Wisconsin \
   --lr 0.001 \
   --ch 256 \
