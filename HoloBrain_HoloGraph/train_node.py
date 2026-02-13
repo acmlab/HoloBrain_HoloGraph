@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from torch import optim
 
-from source.training_utils import LinearWarmupScheduler
+from source.utils import LinearWarmupScheduler
 
 
 import accelerate
@@ -16,8 +16,8 @@ from accelerate import Accelerator
 
 from torch_geometric.datasets import Planetoid
 from torch_geometric.datasets import WebKB, Actor, WikipediaNetwork, Planetoid
-from source.layers.common_layers_node import compute_weighted_metrics
-from source.models.net_node import HoloGraph
+from source.utils import compute_weighted_metrics
+from source.holograph import HoloGraph
 from ema_pytorch import EMA
 
 
@@ -75,25 +75,9 @@ def build_arg_parser():
     parser.add_argument("--data", type=str, default="Cora")
     parser.add_argument("--batchsize", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument(
-        "--data_imsize",
-        type=int,
-        default=None,
-        help="Image size. If None, use the default size of each dataset",
-    )
-
     # General model options
     parser.add_argument("--L", type=int, default=1, help="num of layers")
     parser.add_argument("--ch", type=int, default=256, help="num of channels")
-    parser.add_argument(
-        "--imsize",
-        type=int,
-        default=None,
-        help=(
-            "Model's imsize. This is used when you want finetune a pretrained model "
-            "that was trained on images with different resolution than the finetune image dataset."
-        ),
-    )
     parser.add_argument("--ksize", type=int, default=1, help="kernel size")
     parser.add_argument("--Q", type=int, default=8, help="num of recurrence")
     parser.add_argument("--num_class", type=int, default=6, help="num of class")
@@ -105,8 +89,6 @@ def build_arg_parser():
         "--heads", type=int, default=8, help="num of heads in self-attention"
     )
     parser.add_argument("--dropout", type=float, default=0.1, help="dropout rate")
-
-
     parser.add_argument("--N", type=int, default=4, help="num of rotating dimensions")
     parser.add_argument("--gamma", type=float, default=1.0, help="step size")
     parser.add_argument("--J", type=str, default="attn", help="connectivity")
@@ -231,26 +213,22 @@ def run_planetoid_public(args, accelerator: Accelerator, device: torch.device):
     net = HoloGraph(
         n=args.N,
         ch=args.ch,
-        L=args.L,              
+        L=args.L,
         Q=args.Q,
         gamma=args.gamma,
         J=args.J,
         use_omega=args.use_omega,
         global_omg=args.global_omg,
         c_norm=args.c_norm,
-        num_class=data.y.max().item() + 1, 
-        feature_dim=data.x.size(-1),        
+        num_class=args.num_class,
+        feature_dim=data.x.shape[1],
+        init_omg=args.init_omg,
+        maxpool=args.maxpool,
+        heads=args.heads,
         dropout=args.dropout,
-        homo=True,
-
-        gst_level=1,           
-        gst_wavelet=(0,1,2),   
-
-        init_x_from="gst",    
-        fuse_y_into_x=False,  
-        pred_from="y",         
+        use_residual=True,
+        homo=args.homo,
     ).to(device)
-
 
     total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
     print(f"Total number of basemodel parameters: {total_params}")
@@ -373,8 +351,6 @@ def run_heterophilic(args, accelerator: Accelerator, device: torch.device):
 
     if args.feature_dim is None or args.feature_dim <= 0:
         args.feature_dim = data0.num_nodes
-    if args.imsize is None or args.imsize <= 0:
-        args.imsize = num_features
     args.num_class = num_classes
     print("args.feature_dim: ", args.feature_dim)
 
@@ -386,24 +362,21 @@ def run_heterophilic(args, accelerator: Accelerator, device: torch.device):
         return HoloGraph(
         n=args.N,
         ch=args.ch,
-        L=args.L,              
+        L=args.L,
         Q=args.Q,
         gamma=args.gamma,
         J=args.J,
         use_omega=args.use_omega,
         global_omg=args.global_omg,
         c_norm=args.c_norm,
-        num_class=data.y.max().item() + 1, 
-        feature_dim=data.x.size(-1),        
+        num_class=args.num_class,
+        feature_dim=data.x.shape[1],
+        init_omg=args.init_omg,
+        maxpool=args.maxpool,
+        heads=args.heads,
         dropout=args.dropout,
-        homo=False,
-
-        gst_level=1,           
-        gst_wavelet=(0,1,2),   
-
-        init_x_from="gst",    
-        fuse_y_into_x=False,  
-        pred_from="y",         
+        use_residual=True,
+        homo=args.homo,
     ).to(device)
 
     def build_optimizer(model):
