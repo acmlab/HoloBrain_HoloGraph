@@ -1,116 +1,199 @@
 import torch
+import torch.nn as nn
 
-class Wavelet(torch.nn.Module):
-    def __init__(self, wavelet=[0, 1, 2], level=2):
-        super(Wavelet, self).__init__()
-        self.wavelet = wavelet
-        self.level = level
+def diffusion_P_from_L_heat(W, tau=1.0, normalized=True, eps=1e-12):
+    # W: [B,N,N]
+    B, N, _ = W.shape
+    W = 0.5*(W + W.transpose(-1,-2))
+    deg = W.sum(-1).clamp_min(eps)
+    D = torch.diag_embed(deg)
 
+    if normalized:
+        Dm12 = torch.diag_embed(torch.rsqrt(deg))
+        L = torch.eye(N, device=W.device).unsqueeze(0).expand(B,-1,-1) - Dm12 @ W @ Dm12
+    else:
+        L = D - W
+
+    # P = exp(-tau L)
+    P = torch.matrix_exp(-tau * L)
+    return P, L
+class GSTWavelet(nn.Module):
+    """
+    Clean GST implementation aligned with paper Eq.(4):
+
+    Lazy random walk:
+        P = 0.5 * (I + W D^{-1})
+
+    Wavelets:
+        psi^0 = I - P
+        psi^h = P^{2^{h-1}} - P^{2^{h}}   for h>=1
+
+    Low-pass:
+        Phi = P^{2^J}
+
+    Scattering (windowed):
+        Apply wavelets at each layer, take abs, collect outputs,
+        then apply Phi on concatenated basis.
+    """
+    def __init__(
+        self,
+        wavelet_orders=(0, 1, 2),
+        level=2,
+        J_lowpass=None,
+        eps=1e-12,
+        make_symmetric=True,
+        add_self_loops_if_isolated=True,
+    ):
+        super().__init__()
+        self.wavelet_orders = [int(o) for o in wavelet_orders]
+        self.level = int(level)
+        self.eps = float(eps)
+        self.make_symmetric = bool(make_symmetric)
+        self.add_self_loops_if_isolated = bool(add_self_loops_if_isolated)
+        self.J_lowpass = int(J_lowpass) if J_lowpass is not None else max(self.wavelet_orders)
+
+    # ---------- core math ----------
+    def _sanitize_W(self, W):
+        """
+        W: [B,N,N] dense adjacency (can be weighted).
+        Minimal fixes:
+          - optional symmetrize
+          - if isolated nodes exist: add self-loops
+        """
+        if self.make_symmetric:
+            W = 0.5 * (W + W.transpose(-1, -2))
+
+        if self.add_self_loops_if_isolated:
+            deg = W.sum(dim=-1)  # [B,N]
+            isolated = deg <= self.eps
+            if isolated.any():
+                B, N, _ = W.shape
+                eye = torch.eye(N, device=W.device, dtype=W.dtype).unsqueeze(0).expand(B, -1, -1)
+                # set diagonal to 1 only at isolated nodes
+                # mask: [B,N] -> [B,N,1] -> broadcast on diag via eye
+                mask = isolated.unsqueeze(-1)
+                W = W + eye * mask.to(W.dtype)
+
+        return W
+
+    def _lazy_random_walk_P(self, W):
+        """
+        P = 0.5 * (I + W D^{-1}) 
+        D is diagonal with D_ii = sum_j W_ij  (row-sum degree)
+        """
+        B, N, _ = W.shape
+        deg = W.sum(dim=-1).clamp_min(self.eps)  # [B,N]
+        Dinv = torch.diag_embed(1.0 / deg)       # [B,N,N]
+        I = torch.eye(N, device=W.device, dtype=W.dtype).unsqueeze(0).expand(B, -1, -1)
+        P = 0.5 * (I + torch.bmm(W, Dinv))
+        return P
+
+    def _pow_2k(self, M, k):
+        """Return M^(2^k) by repeated squaring k times."""
+        out = M
+        for _ in range(k):
+            out = torch.bmm(out, out)
+        return out
+    
+
+    def _lazy_random_walk_P(self, W):
+        P, L = diffusion_P_from_L_heat(W, tau=1.0, normalized=True, eps=self.eps)
+        return P
     def construct_wavelet(self, adj):
-        adj = self.no_zero_adj(adj)
+        """
+        adj: [B,N,N] or [N,N]
+        Returns:
+          wavelets: list of [B,N,N] matrices [psi^order]
+          low_pass: [B,N,N] = P^(2^J_lowpass)
+          P: [B,N,N] (optional useful for debug)
+        """
+        if adj.dim() == 2:
+            adj = adj.unsqueeze(0)
+        elif adj.dim() != 3:
+            raise ValueError(f"adj must be [N,N] or [B,N,N], got {tuple(adj.shape)}")
+
+        W = adj.float()
+        W = self._sanitize_W(W)
+        P = self._lazy_random_walk_P(W) # use W directly
+        # P, L = diffusion_P_from_L_heat(W, tau=1.0, normalized=True, eps=self.eps) # use Laplacian
+
+        B, N, _ = P.shape
+        I = torch.eye(N, device=P.device, dtype=P.dtype).unsqueeze(0).expand(B, -1, -1)
+
+        # Precompute P^(2^h) for needed h
+        max_h = max(max(self.wavelet_orders), self.J_lowpass)
+        P_pows = {0: P}  # P^(2^0) = P
+        cur = P
+        for h in range(1, max_h + 1):
+            cur = torch.bmm(cur, cur)     # square -> P^(2^h)
+            P_pows[h] = cur
+
         wavelets = []
-        degree = torch.sum(adj, dim=-1)
-        if (degree == 0).any():
-            raise ValueError("The adj has isolated nodes (degree=0).")
-        D = torch.diag_embed(degree)
-        D = D.to(adj.device)
-        adj = D - adj
-        D_inverse = torch.inverse(D)
-        D_inverse[D_inverse == float("inf")] = 0.0
-        I_n = torch.eye(adj.size(-1)).unsqueeze(0).repeat(adj.size(0), 1, 1).float()
-        I_n = I_n.to(adj.device)
-        adj = 0.5 * (I_n + torch.bmm(adj, D_inverse))
-        adj_sct = adj.float()
-        adj_power = adj_sct.clone()
-        for order in self.wavelet:
+        for order in self.wavelet_orders:
             if order == 0:
-                wavelets.append(I_n - adj_sct)
-                continue
-            if order > 1:
-                adj_power = torch.bmm(adj_power, adj_power)
-            # S^n(S^n-I)
-            adj_int = torch.bmm(adj_power, I_n - adj_power)
-            wavelets.append(adj_int)
-            # print(adj_int.shape)
+                psi = I - P
+            else:
+                # psi^h = P^(2^(h-1)) - P^(2^h)
+                psi = P_pows[order - 1] - P_pows[order]
+            wavelets.append(psi)
 
-        low_pass = torch.bmm(adj_power, adj_power)  # t^(2^j)
-        low_pass = torch.bmm(low_pass, low_pass)  # t^(2^(j+1))
-        return wavelets, low_pass
+        # Phi = P^(2^J)
+        low_pass = P_pows[self.J_lowpass]
+        return wavelets, low_pass, P
 
-    def no_zero_adj(self, adj):
-        batch_size, n, _ = adj.shape
-        adj_fixed_batch = adj.clone()
-        
-        for b in range(batch_size):
-            adj = adj_fixed_batch[b]
-            zero_row_mask = (adj.sum(dim=-1) == 0)
-            zero_row_indices = torch.where(zero_row_mask)[0]
-            if len(zero_row_indices) == 0:
-                continue
-
-            for zero_row in zero_row_indices:
-                prev_row = zero_row - 1
-                while prev_row >= 0 and zero_row_mask[prev_row]:
-                    prev_row -= 1
-                
-                if prev_row >= 0: 
-                    adj[zero_row, :] = adj[prev_row, :]
-                else:  
-                    next_row = zero_row + 1
-                    while next_row < n and zero_row_mask[next_row]:
-                        next_row += 1
-                    if next_row < n:
-                        adj[zero_row, :] = adj[next_row, :]
-
-            adj_symmetric = (adj + adj.T) / 2
-            adj_fixed_batch[b] = adj_symmetric
-
-        return adj_fixed_batch
-
+    # ---------- scattering ----------
     def windowed(self, x, adj):
-        # x: B x N x T
-        # y: B x N x T x dim
-        wavelets, low_pass = self.construct_wavelet(adj)
-        outputs = [[x.transpose(1, 2)]]
-        for layer in range(self.level):
+        """
+        x: [B,F,N] 
+        adj: [B,N,N] or [N,N]
+        Returns:
+          scattering_coeff: [B,N,F,dim] where dim depends on level and wavelet_orders
+        """
+        wavelets, Phi, _ = self.construct_wavelet(adj)
+
+        # Start with node-signal in shape [B,N,F]
+        if x.dim() != 3:
+            raise ValueError(f"x must be [B,F,N], got {tuple(x.shape)}")
+        x0 = x.transpose(1, 2).contiguous()  # [B,N,F]
+
+        outputs = [[x0]]  # list of layers, each layer is list of tensors [B,N,F]
+        for _layer in range(self.level):
             layer_output = []
-            for input in outputs[-1]:
-                for wavelet in wavelets:
-                    out = torch.matmul(wavelet, input)
+            for inp in outputs[-1]:
+                for psi in wavelets:
+                    out = torch.matmul(psi, inp)  # [B,N,N] @ [B,N,F] -> [B,N,F]
                     out = torch.abs(out)
                     layer_output.append(out)
             outputs.append(layer_output)
 
+        # basis: concat all layers along "feature bank" dimension
+        # each layer: stack(..., dim=-1) -> [B,N,F,K]
+        # then cat over layers -> [B,N,F,dim]
         basis = torch.cat([torch.stack(layer, dim=-1) for layer in outputs], dim=-1)
 
-        basis_shape = basis.shape
-        basis = basis.view(basis.shape[0], basis.shape[1], -1)
-        scattering_coeff = torch.matmul(low_pass, basis)
-        scattering_coeff = scattering_coeff.view(basis_shape)
-        # B x N x T x dim
-        return scattering_coeff
+        # Apply low-pass Phi on node dimension for each basis channel
+        B, N, F, D = basis.shape
+        basis_flat = basis.view(B, N, F * D)              # [B,N,F*D]
+        sc_flat = torch.matmul(Phi, basis_flat)           # [B,N,N]@[B,N,F*D] -> [B,N,F*D]
+        scattering = sc_flat.view(B, N, F, D)             # [B,N,F,D]
+        return scattering
 
     def nonwindowed(self, x, adj):
-        wavelets, low_pass = self.construct_wavelet(adj)
-        outputs = [[x.transpose(1, 2)]]
-        for layer in range(self.level):
+        """
+        return the multi-layer basis without low-pass.
+        """
+        wavelets, _, _ = self.construct_wavelet(adj)
+        x0 = x.transpose(1, 2).contiguous()  # [B,N,F]
+        outputs = [[x0]]
+        for _layer in range(self.level):
             layer_output = []
-            for input in outputs[-1]:
-                for wavelet in wavelets:
-                    out = torch.matmul(wavelet, input)
+            for inp in outputs[-1]:
+                for psi in wavelets:
+                    out = torch.matmul(psi, inp)
                     out = torch.abs(out)
                     layer_output.append(out)
             outputs.append(layer_output)
-
-        # B x N x T x dim
-        basis = torch.cat([torch.stack(layer, dim=-1) for layer in outputs], dim=-1)
-        Q = 2
-        gst = []
-        for q in range(1, Q + 1):
-            q_st = basis**q
-            q_st = torch.mean(q_st, dim=1)
-            gst.append(q_st)
-        gst = torch.stack(gst, dim=-1)  # B x T x Q*dim
+        basis = torch.cat([torch.stack(layer, dim=-1) for layer in outputs], dim=-1)  # [B,N,F,dim]
         return basis
 
     def forward(self, x, adj, windowed=True):
