@@ -3,7 +3,7 @@ import os
 import logging
 import copy
 import numpy as np
-
+from torch.nn.parameter import UninitializedParameter
 import torch
 import torch.nn as nn
 from torch import optim
@@ -17,7 +17,7 @@ from accelerate import Accelerator
 from torch_geometric.datasets import Planetoid
 from torch_geometric.datasets import WebKB, Actor, WikipediaNetwork, Planetoid
 from source.utils import compute_weighted_metrics
-from source.holograph import HoloGraph
+from source.holograph_holobrain import HoloGraph
 from ema_pytorch import EMA
 
 
@@ -229,7 +229,10 @@ def run_planetoid_public(args, accelerator: Accelerator, device: torch.device):
         homo=args.homo,
     ).to(device)
 
-    total_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    total_params = sum(
+    p.numel() for p in net.parameters()
+    if p.requires_grad and not isinstance(p, UninitializedParameter)
+)
     print(f"Total number of basemodel parameters: {total_params}")
 
     if args.finetune:
