@@ -37,8 +37,8 @@ class HoloGraph(nn.Module):
         dropout=0.5,    
         learn_omg=False,
         homo=False,
-        level=3,
-        order=0,
+        level=1,
+        order=2,
         gst_total=4,
     ):
         super().__init__()
