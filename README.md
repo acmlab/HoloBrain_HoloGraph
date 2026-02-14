@@ -1,5 +1,4 @@
-## Explore brain-inspired machine intelligencefor connecting dots on graphs throughholographic blueprint of oscillatory synchronization
-### From HoloBrain to HoloGraph: A Very First Step to Explore Machine Intelligence for Connecting Dots on Graphs
+## Explore brain-inspired machine intelligencefor connecting dots on graphs throughholographic blueprint of oscillatorysynchronizat
 
 ```plaintext
 HoloBrain_HoloGraph/
@@ -8,11 +7,10 @@ HoloBrain_HoloGraph/
  │   ├─ data/
  │   │   ├─ create_dataset.py    
  │   │   └─ dataset.py            # Data loading for different brain data
- │   ├─ layers/
+ │   ├─ modules/
  │   │   ├─ GST.py                # GST module (Graph Sattering Transform)
- │   │   └─ kurmotorlayer.py    # Kuramoto solver for oscillator synchronization
- │   ├─ layers/
- │       ├─ net_node.py                  # The main HoloGraph model
+ │   │   └─ kuramoto_layer.py    # Kuramoto solver for oscillator synchronization
+ │   ├─ holograph.py                  # The main HoloGraph model
  │   └─ utils.py                  
  ├─ train_brain.py                # Script for brain data
  ├─ train_cluster.py              # Script for unsupervised clustering
