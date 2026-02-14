@@ -106,13 +106,13 @@ python train_node.py \
 ### Single-GPU / CPU
 
 ```bash
-python train_brain.py --L 2 --N 4 --batchsize 256 --T 8 --h 256 --epochs 200 --data HCP-YA --gpu 0
+python train_brain.py --L 2 --N 4 --batchsize 256 --Q 8 --h 256 --epochs 200 --data HCP-YA --gpu 0
 ```
 
 ### Multi-GPU with Accelerate
 
 ```bash
-accelerate launch --multi_gpu --num_processes 2 --gpu_ids 0,1 --main_process_port 29500 train_brain.py --L 2 --N 4 --batchsize 256 --T 8 --ch 256 --epochs 200 --data HCP-YA  
+accelerate launch --multi_gpu --num_processes 2 --gpu_ids 0,1 --main_process_port 29500 train_brain.py --L 2 --N 4 --batchsize 256 --Q 8 --ch 256 --epochs 200 --data HCP-YA  
 ```
 
 ### Key Arguments
