@@ -78,7 +78,6 @@ def build_arg_parser():
     # General model options
     parser.add_argument("--L", type=int, default=1, help="num of layers")
     parser.add_argument("--ch", type=int, default=256, help="num of channels")
-    parser.add_argument("--ksize", type=int, default=1, help="kernel size")
     parser.add_argument("--Q", type=int, default=8, help="num of recurrence")
     parser.add_argument("--num_class", type=int, default=6, help="num of class")
     parser.add_argument("--feature_dim", type=int, default=None, help="num of channels of features")
