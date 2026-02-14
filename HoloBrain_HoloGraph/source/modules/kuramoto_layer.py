@@ -5,7 +5,7 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_dense_adj
 import numpy as np
 
-from source.modules.common_layers_node import ScaleAndBias, Attention, adj_connectivity
+from source.utils import ScaleAndBias, Attention, adj_connectivity
 
 
 class OmegaModule(nn.Module):
