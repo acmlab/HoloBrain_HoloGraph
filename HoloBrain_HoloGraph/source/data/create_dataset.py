@@ -1,4 +1,4 @@
-from dataset import *
+from source.data.dataset import *
 
 def create_dataset(data):
     if data == "HCP-A":
