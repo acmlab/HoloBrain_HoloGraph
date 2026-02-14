@@ -10,7 +10,7 @@ HoloBrain_HoloGraph/
  │   ├─ modules/
  │   │   ├─ GST.py                # GST module (Graph Sattering Transform)
  │   │   └─ kuramoto_layer.py    # Kuramoto solver for oscillator synchronization
- │   ├─ holograph.py                  # The main HoloGraph model
+ │   ├─ holograph_holobrain.py                  # The main HoloGraph/HoloBrain model
  │   └─ utils.py                  
  ├─ train_brain.py                # Script for brain data
  ├─ train_cluster.py              # Script for unsupervised clustering
