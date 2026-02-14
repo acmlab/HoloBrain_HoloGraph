@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_dense_adj
 import numpy as np
-
+import torch.nn.functional as F
 from source.utils import ScaleAndBias, Attention, adj_connectivity
 
 
@@ -34,33 +34,179 @@ class OmegaModule(nn.Module):
         out[..., 1] = -omg * x_pairs[..., 0]
         return out.view(B, N, C)
 
+# class SyncModule(nn.Module):
+#     """
+#     Coupling / Synchronization.
+#     - conv: GCNConv (edge_index)
+#     - attn: Attention (no graph needed or uses x only)
+#     - adj : dense coupling using W @ x   (paper-consistent)
+#     """
+#     def __init__(self, J, ch, heads=8, learn_wscale=False):
+#         super().__init__()
+#         self.type = J
+
+#         if J == "conv":
+#             self.net = GCNConv(ch, ch)
+#         elif J == "attn":
+#             self.net = Attention(ch, heads=heads, weight="fc")
+#         elif J == "adj":
+#             # optional learnable scalar; set learn_wscale=False for strict paper
+#             self.w_scale = nn.Parameter(torch.tensor(1.0), requires_grad=learn_wscale)
+#         else:
+#             raise NotImplementedError(f"Unknown mapping_type/J: {J}")
+
+#     def forward(self, x, graph_struct):
+#         """
+#         x: [B, N, C]
+#         graph_struct:
+#             - conv: edge_index [2, E]
+#             - adj : W [N, N] or [B, N, N]
+#         """
+#         if self.type == "conv":
+#             if x.dim() == 3 and x.size(0) == 1:
+#                 return self.net(x.squeeze(0), graph_struct).unsqueeze(0)
+#             raise NotImplementedError("Batch>1 not supported for conv yet.")
+
+#         if self.type == "adj":
+#             W = graph_struct
+#             if W.dim() == 2:
+#                 W = W.unsqueeze(0)              # [1, N, N]
+#             # dense coupling: W @ x
+#             return self.w_scale * torch.bmm(W, x)
+
+#         # attn
+#         return self.net(x)
 
 class SyncModule(nn.Module):
-    def __init__(self, J, ch, heads=8, feature_dim=116):
+    """
+    Coupling / Synchronization.
+
+    - conv: GCNConv (edge_index)
+    - attn: Attention (uses x only)
+    - adj : dense coupling using K @ x, where K = W ⊙ A 
+            A is chosen as a low-rank symmetric learnable matrix: A = U U^T.
+
+    Args (adj mode):
+      - A_rank: rank r for U ∈ R^{N×r}; params ~ N*r (safe for large N)
+      - A_act:  "sigmoid" (default) -> gate in (0,1), stable
+               "softplus" -> positive gate
+               "none"     -> no activation (raw A)
+      - normalize_K: if True, row-normalize K to stabilize dynamics
+      - eps: small constant for normalization
+      - learn_wscale: optional scalar multiplier (default False = strict)
+    """
+    def __init__(
+        self,
+        J: str,
+        ch: int,
+        heads: int = 8,
+        learn_wscale: bool = False,
+        # --- adj specific ---
+        use_A: bool = True,
+        A_rank: int = 16,
+        A_act: str = "sigmoid",
+        normalize_K: bool = True,
+        eps: float = 1e-12,
+    ):
         super().__init__()
         self.type = J
+
         if J == "conv":
             self.net = GCNConv(ch, ch)
+
         elif J == "attn":
             self.net = Attention(ch, heads=heads, weight="fc")
+
         elif J == "adj":
-            self.net = adj_connectivity(feature_dim)
+            self.use_A = bool(use_A)
+            self.A_rank = int(A_rank)
+            self.A_act = str(A_act).lower()
+            self.normalize_K = bool(normalize_K)
+            self.eps = float(eps)
+
+            self.w_scale = nn.Parameter(torch.tensor(1.0), requires_grad=learn_wscale)
+
+            self.U = None
+
         else:
             raise NotImplementedError(f"Unknown mapping_type/J: {J}")
 
-    def forward(self, x, graph_struct):
+    # -------------------------
+    # helpers for adj branch
+    # -------------------------
+    def _ensure_U(self, N: int, device, dtype):
+        """
+        Lazy-init U ∈ R^{N×r} once N is known.
+        If N changes, re-init to match (rare; but safe).
+        """
+        if (self.U is None) or (self.U.shape[0] != N) or (self.U.shape[1] != self.A_rank):
+            U = torch.randn(N, self.A_rank, device=device, dtype=dtype) * 0.01
+            self.U = nn.Parameter(U, requires_grad=True)
+        return self.U
+
+    def _apply_A_activation(self, A: torch.Tensor) -> torch.Tensor:
+        """
+        A: [B,N,N] (or broadcastable)
+        """
+        if self.A_act == "sigmoid":
+            return torch.sigmoid(A)
+        if self.A_act == "softplus":
+            return F.softplus(A)
+        if self.A_act in ("none", "identity", ""):
+            return A
+        raise ValueError(f"Unknown A_act={self.A_act}")
+
+    def _build_K(self, W: torch.Tensor) -> torch.Tensor:
+        """
+        W: [B,N,N] dense
+        Return K: [B,N,N]
+        """
+        # symmetrize W 
+        W = 0.5 * (W + W.transpose(-1, -2))
+
+        if not self.use_A:
+            K = W
+        else:
+            B, N, _ = W.shape
+            U = self._ensure_U(N, W.device, W.dtype)        # [N,r]
+            A = U @ U.t()                                   # [N,N] symmetric
+            A = A.unsqueeze(0).expand(B, -1, -1)            # [B,N,N]
+            A = self._apply_A_activation(A)
+            K = W * A                                       # Hadamard: K = W ⊙ A
+
+        if self.normalize_K:
+            deg = K.sum(dim=-1).clamp_min(self.eps)         # [B,N]
+            K = K / deg.unsqueeze(-1)                       # row-normalize
+
+        return K
+
+    # -------------------------
+    # forward
+    # -------------------------
+    def forward(self, x: torch.Tensor, graph_struct):
+        """
+        x: [B,N,C]
+        graph_struct:
+          - conv: edge_index [2,E]
+          - adj : W [N,N] or [B,N,N]
+        """
         if self.type == "conv":
             if x.dim() == 3 and x.size(0) == 1:
                 return self.net(x.squeeze(0), graph_struct).unsqueeze(0)
             raise NotImplementedError("Batch>1 not supported for conv yet.")
-        elif self.type == "adj":
-            if hasattr(self.net, "update_latest_A_weighted"):
-                self.net.update_latest_A_weighted(graph_struct * self.net.weight)
-            return self.net(x, graph_struct)
-        else:
-            return self.net(x)
 
+        if self.type == "adj":
+            W = graph_struct
+            if W.dim() == 2:
+                W = W.unsqueeze(0)  # [1,N,N]
+            elif W.dim() != 3:
+                raise ValueError(f"adj expects W as [N,N] or [B,N,N], got {tuple(W.shape)}")
 
+            K = self._build_K(W)                    # [B,N,N]
+            return self.w_scale * torch.bmm(K, x)   # [B,N,C]
+
+        # attn
+        return self.net(x)
 class Kuramoto_Solver(nn.Module):
     def __init__(
         self,
@@ -84,7 +230,18 @@ class Kuramoto_Solver(nn.Module):
         self.J_type = J
         self.eps = eps
         self.omega_module = OmegaModule(n, ch, init_omg, global_omg, learn_omg) if use_omega else None
-        self.sync_module = SyncModule(J, ch, heads, feature_dim)
+        # self.sync_module = SyncModule(J, ch, heads=heads, learn_wscale=False)
+        self.sync_module = SyncModule(
+    J, ch,
+    heads=heads,
+    learn_wscale=False,  
+    use_A=True,           
+    A_rank=16,            
+    A_act="sigmoid",      
+    normalize_K=False,     
+)
+
+        # self.sync_module = SyncModule(J, ch, heads, feature_dim)
         self.return_energy = return_energy
         if c_norm == "gn":
             self.norm_y = nn.GroupNorm(ch // n, ch, affine=True)
@@ -127,15 +284,26 @@ class Kuramoto_Solver(nn.Module):
             y = y.transpose(1, 2).contiguous()
         y = self.norm_y(y)
         y = y.transpose(1, 2).contiguous()  # [B,N,C]
-
+        y = self.map_to_sphere(y) 
         if x.shape[1] == self.ch:
             x = x.transpose(1, 2).contiguous()  # [B,N,C]
-
+        B = x.size(0)
         # graph struct
         if self.J_type == "conv":
-            graph_struct = torch.nonzero(sc.squeeze(), as_tuple=False).T
+            # accept either edge_index or dense W
+            if sc.dim() == 2 and sc.size(0) == 2:
+                graph_struct = sc.long()  # edge_index
+            else:
+                # dense -> edge_index
+                W = sc.squeeze(0) if sc.dim() == 3 else sc
+                graph_struct = torch.nonzero(W, as_tuple=False).T.long()
         elif self.J_type == "adj":
-            graph_struct = to_dense_adj(sc).squeeze(0) if sc.dim() == 2 else sc.squeeze(0)
+            # accept either edge_index or dense W
+            if sc.dim() == 2 and sc.size(0) == 2:
+                N = x.size(1) if x.dim() == 3 else None
+                graph_struct = to_dense_adj(sc.long(), max_num_nodes=N).squeeze(0).float()  # [N,N]
+            else:
+                graph_struct = (sc.squeeze(0) if sc.dim() == 3 else sc).float()             # [N,N]
         else:
             graph_struct = None
 
@@ -153,7 +321,7 @@ class Kuramoto_Solver(nn.Module):
                         W_dense = graph_struct
         for _ in range(Q):
             # coupling + control
-            coupling = self.sync_module(x, graph_struct) if self.J_type != "attn" else self.sync_module(x, graph_struct)
+            coupling = self.sync_module(x, graph_struct)
             force = coupling + y
             # omega
             omega_term = self.omega_module(x) if self.omega_module else 0.0
