@@ -240,7 +240,7 @@ class HoloGraph(nn.Module):
         # # x = self.proj_x0(inp.transpose(1, 2)).transpose(1, 2)
         # # print("x shape: ", x.shape, "c shape: ", c.shape)
 
-        # # brain
+        # # holobrain
         # # Use GST to get x
         # x = self.gst(inp, inp_sc)  # Use Wavelet (GST) to get x
         # x = x.flatten(start_dim=2)
