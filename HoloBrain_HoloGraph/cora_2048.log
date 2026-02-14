@@ -1,0 +1,45 @@
+Standard semi-supervised split:
+  Training nodes: 140 (5.17%)
+  Validation nodes: 500 (18.46%)
+  Test nodes: 1000 (36.93%)
+Dataset info - num_nodes: 2708, feature_dim: 1433, num_classes: 7
+Parameters: ch=2048, L=4, Q=8, gamma=1.0, dropout=0.5
+Total number of basemodel parameters: 153171975
+Epoch 001, Loss: 2.3382, Val Acc: 0.2860, Test Acc: 0.2870, Test Pre: 0.2931, Test F1: 0.1874, LR: 0.000500
+Epoch 010, Loss: 0.0273, Val Acc: 0.7840, Test Acc: 0.8040, Test Pre: 0.8197, Test F1: 0.8059, LR: 0.000500
+Epoch 020, Loss: 0.0010, Val Acc: 0.7800, Test Acc: 0.7990, Test Pre: 0.8134, Test F1: 0.8030, LR: 0.000500
+Epoch 030, Loss: 0.0001, Val Acc: 0.7900, Test Acc: 0.8110, Test Pre: 0.8184, Test F1: 0.8130, LR: 0.000500
+Epoch 040, Loss: 0.0001, Val Acc: 0.7800, Test Acc: 0.7950, Test Pre: 0.8079, Test F1: 0.7975, LR: 0.000500
+Epoch 050, Loss: 0.0001, Val Acc: 0.7800, Test Acc: 0.7990, Test Pre: 0.8117, Test F1: 0.8014, LR: 0.000500
+Epoch 060, Loss: 0.0000, Val Acc: 0.7780, Test Acc: 0.8020, Test Pre: 0.8128, Test F1: 0.8041, LR: 0.000500
+Epoch 070, Loss: 0.0001, Val Acc: 0.7760, Test Acc: 0.8020, Test Pre: 0.8122, Test F1: 0.8040, LR: 0.000500
+Epoch 080, Loss: 0.0000, Val Acc: 0.7780, Test Acc: 0.8020, Test Pre: 0.8122, Test F1: 0.8040, LR: 0.000500
+Epoch 090, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8030, Test Pre: 0.8128, Test F1: 0.8049, LR: 0.000500
+Epoch 100, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8030, Test Pre: 0.8128, Test F1: 0.8049, LR: 0.000500
+Epoch 110, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8030, Test Pre: 0.8128, Test F1: 0.8049, LR: 0.000500
+Epoch 120, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8030, Test Pre: 0.8128, Test F1: 0.8049, LR: 0.000500
+Epoch 130, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8030, Test Pre: 0.8128, Test F1: 0.8049, LR: 0.000500
+Epoch 140, Loss: 0.0000, Val Acc: 0.7780, Test Acc: 0.8060, Test Pre: 0.8147, Test F1: 0.8077, LR: 0.000500
+Epoch 150, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8050, Test Pre: 0.8140, Test F1: 0.8067, LR: 0.000500
+Epoch 160, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8050, Test Pre: 0.8140, Test F1: 0.8067, LR: 0.000500
+Epoch 170, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8070, Test Pre: 0.8155, Test F1: 0.8086, LR: 0.000500
+Epoch 180, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8050, Test Pre: 0.8138, Test F1: 0.8067, LR: 0.000500
+Epoch 190, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8050, Test Pre: 0.8138, Test F1: 0.8067, LR: 0.000500
+Epoch 200, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8050, Test Pre: 0.8134, Test F1: 0.8066, LR: 0.000500
+Epoch 210, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8050, Test Pre: 0.8131, Test F1: 0.8065, LR: 0.000500
+Epoch 220, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8040, Test Pre: 0.8123, Test F1: 0.8055, LR: 0.000500
+Epoch 230, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8060, Test Pre: 0.8141, Test F1: 0.8074, LR: 0.000500
+Epoch 240, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8060, Test Pre: 0.8141, Test F1: 0.8074, LR: 0.000500
+Epoch 250, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8060, Test Pre: 0.8141, Test F1: 0.8074, LR: 0.000500
+Epoch 260, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8070, Test Pre: 0.8148, Test F1: 0.8083, LR: 0.000500
+Epoch 270, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8070, Test Pre: 0.8148, Test F1: 0.8083, LR: 0.000500
+Epoch 280, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8060, Test Pre: 0.8139, Test F1: 0.8074, LR: 0.000500
+Epoch 290, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8070, Test Pre: 0.8145, Test F1: 0.8084, LR: 0.000500
+Epoch 300, Loss: 0.0000, Val Acc: 0.7760, Test Acc: 0.8070, Test Pre: 0.8145, Test F1: 0.8084, LR: 0.000500
+
+================================================================================
+Best test accuracy: 0.8220 (Epoch 12)
+Acc at best validation: 0.8160 (Epoch 24)
+F1 at best validation: 0.8179
+Precision at best validation: 0.8223
+================================================================================
