@@ -14,26 +14,10 @@ from sklearn.model_selection import KFold
 from accelerate import Accelerator, utils
 from torch.distributed.nn.functional import all_gather
 
-from source.utils import LinearWarmupScheduler, compute_weighted_metrics
+from source.utils import LinearWarmupScheduler, compute_weighted_metrics, create_logger
 from source.data.create_dataset import create_dataset
-from source.holograph import HoloGraph 
+from source.holograph_holobrain import HoloBrain 
 from ema_pytorch import EMA  
-
-def create_logger(logging_dir):
-    if not os.path.exists(logging_dir):
-        os.makedirs(logging_dir)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[\033[34m%(asctime)s\033[0m] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler(f"{logging_dir}/log.txt", mode='w'),
-        ],
-        force=True
-    )
-    logger = logging.getLogger(__name__)
-    return logger
 
 def train_one_epoch(model, ema, optimizer, scheduler, train_loader, epoch, device, accelerator, logger):
     model.train()
@@ -44,7 +28,6 @@ def train_one_epoch(model, ema, optimizer, scheduler, train_loader, epoch, devic
         features = features.to(device)
         adj = adj.to(device)
         
-        # Ensure batch dim [B, N, F]
         if features.dim() == 2:
             features = features.unsqueeze(0)
             
@@ -53,6 +36,7 @@ def train_one_epoch(model, ema, optimizer, scheduler, train_loader, epoch, devic
 
         optimizer.zero_grad()
         
+        # HoloBrain Forward
         outputs, x_features, y_features = model(features, features, adj)
         
         if isinstance(outputs, list):
@@ -92,7 +76,6 @@ def evaluate(model, accelerator, test_loader, device, logger):
             targets = targets.to(device)
             targets = targets.squeeze(1) if targets.dim() == 2 else targets
 
-            # HoloBrain Inference
             outputs, x_features, y_features = model(features, features, adj)
             
             if isinstance(outputs, list):
@@ -115,7 +98,6 @@ def evaluate(model, accelerator, test_loader, device, logger):
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
     
-
     y_feats_t = torch.cat(all_y_feats, dim=0).transpose(1, 2) 
     x_feats_t = torch.cat(all_x_feats, dim=0).transpose(1, 2)
     
@@ -140,16 +122,16 @@ def main():
     parser.add_argument("--data", type=str, default="HCP-YA", help="Dataset name")
     
     # HoloBrain Params
-    parser.add_argument("--num_nodes", type=int, default=116, help="Number of nodes (imsize)")
+    parser.add_argument("--num_nodes", type=int, default=116, help="Number of nodes")
+    
     parser.add_argument("--feature_dim", type=int, default=175, help="Input feature dimension")
+    
     parser.add_argument("--num_class", type=int, default=4, help="Number of classes")
     parser.add_argument("--L", type=int, default=1, help="Number of Kuramoto solvers")
     parser.add_argument("--h", type=int, default=256, help="Hidden dimension (ch)")
-    parser.add_argument("--T", type=int, default=8, help="Number of time steps (Q)")
+    parser.add_argument("--Q", type=int, default=8, help="Number of time steps (Q)")
     parser.add_argument("--N", type=int, default=4, help="Oscillator dimensions")
     parser.add_argument("--gamma", type=float, default=1.0, help="Step size")
-    
-    # Removed irrelevant args (beta, use_pe, node_cls, y_type, etc.)
     
     args = parser.parse_args()
     
@@ -163,12 +145,24 @@ def main():
     accelerator = Accelerator()
     device = accelerator.device
 
-    # Initialize Logger
-    log_dir = "logs_brain"
-    logger = create_logger(log_dir)
+    if not os.path.exists("logs_brain"):
+        os.makedirs("logs_brain")
+    logger = create_logger("logs_brain")
     logger.info("Init successfully")
     
     dataset = create_dataset(args.data)
+
+    try:
+        sample = dataset[0]
+        if isinstance(sample, (tuple, list)) and len(sample) >= 1:
+            sample_features = sample[0]
+            real_dim = sample_features.shape[0]
+            if args.feature_dim != real_dim:
+                logger.info(f"Auto-detected feature_dim: {real_dim} (overriding arg {args.feature_dim})")
+                args.feature_dim = real_dim
+    except Exception as e:
+        logger.warning(f"Could not auto-detect feature dimension: {e}. Using default: {args.feature_dim}")
+    # ============================================================
 
     splits = 5
     kfold = KFold(n_splits=splits, shuffle=True, random_state=args.seed)
@@ -197,18 +191,17 @@ def main():
             num_workers=args.num_workers,
         )
 
-        # [Change 5]: Initialize HoloGraph
-        model = HoloGraph(
+        model = HoloBrain(
             n=args.N,
-            ch=args.h,              # args.h -> ch
+            ch=args.h,              
             L=args.L,
-            Q=args.T,               # args.T -> Q
+            Q=args.Q,               
             num_class=args.num_class,
             feature_dim=args.feature_dim,
-            imsize=args.num_nodes,  # Brain graph size
+            num_nodes=args.num_nodes,  
             gamma=args.gamma,
-            homo=False,             # Brain networks are non-homophilic
-            gst_total=4,            # Default value
+            homo=False,             
+            gst_total=4,            
             dropout=0.5
         ).to(device)
 
@@ -238,10 +231,6 @@ def main():
             
             if test_acc > best_test_acc:
                 best_test_acc, best_pre, best_f1 = test_acc, pre, f1
-                # Optional: Save numpy files for analysis
-                # np.save(os.path.join(".", f"fold_{fold_idx}_features.npy"), features.cpu().detach().numpy())
-                # np.save(os.path.join(".", f"fold_{fold_idx}_inputs.npy"), inputs_data.cpu().detach().numpy())
-                # np.save(os.path.join(".", f"fold_{fold_idx}_gt.npy"), gt.cpu().detach().numpy())
 
         if accelerator.is_main_process:
             torch.save(accelerator.unwrap_model(model).state_dict(), os.path.join(".", "model.pth"))
