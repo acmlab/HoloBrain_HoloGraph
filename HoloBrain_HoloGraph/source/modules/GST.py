@@ -78,27 +78,24 @@ class GSTWavelet(nn.Module):
 
     def _lazy_random_walk_P(self, W):
         """
-        P = 0.5 * (I + W D^{-1}) 
-        D is diagonal with D_ii = sum_j W_ij  (row-sum degree)
+        Paper Eq.(4):
+            P = 0.5 * (I + W D^{-1})
         """
         B, N, _ = W.shape
-        deg = W.sum(dim=-1).clamp_min(self.eps)  # [B,N]
-        Dinv = torch.diag_embed(1.0 / deg)       # [B,N,N]
+        deg = W.sum(dim=-1).clamp_min(self.eps)   # [B,N]
+        Dinv = torch.diag_embed(1.0 / deg)        # [B,N,N]
         I = torch.eye(N, device=W.device, dtype=W.dtype).unsqueeze(0).expand(B, -1, -1)
         P = 0.5 * (I + torch.bmm(W, Dinv))
         return P
 
-    def _pow_2k(self, M, k):
-        """Return M^(2^k) by repeated squaring k times."""
-        out = M
-        for _ in range(k):
-            out = torch.bmm(out, out)
-        return out
-    
+    def _heat_kernel_P(self, W, tau=1.0, normalized=True):
+        P, L = diffusion_P_from_L_heat(W, tau=tau, normalized=normalized, eps=self.eps)
+        return P, L
 
-    def _lazy_random_walk_P(self, W):
-        P, L = diffusion_P_from_L_heat(W, tau=1.0, normalized=True, eps=self.eps)
-        return P
+
+    # def _lazy_random_walk_P(self, W):
+    #     P, L = diffusion_P_from_L_heat(W, tau=1.0, normalized=True, eps=self.eps)
+    #     return P
     def construct_wavelet(self, adj):
         """
         adj: [B,N,N] or [N,N]
