@@ -7,33 +7,6 @@ import numpy as np
 import torch.nn.functional as F
 from source.utils import ScaleAndBias, Attention, adj_connectivity
 
-
-class OmegaModule(nn.Module):
-    def __init__(self, n, ch, init_omg=0.1, global_omg=False, learn_omg=True):
-        super().__init__()
-        self.n = n
-        self.ch = ch
-        self.global_omg = global_omg
-        if n % 2 != 0:
-            raise NotImplementedError("n must be even for OmegaModule (pairwise oscillators).")
-
-        shape = (1, 1) if global_omg else (ch // 2, 1)
-        self.omega_param = nn.Parameter(
-            init_omg * (1 / np.sqrt(2)) * torch.ones(shape),
-            requires_grad=learn_omg
-        )
-
-    def forward(self, x):  # x: [B,N,C]
-        B, N, C = x.shape
-        x_pairs = x.view(B, N, C // 2, 2)
-        omg = torch.norm(self.omega_param, dim=-1, keepdim=True)
-        if not self.global_omg:
-            omg = omg.view(1, 1, C // 2, 1)
-        out = torch.empty_like(x_pairs)
-        out[..., 0] =  omg * x_pairs[..., 1]
-        out[..., 1] = -omg * x_pairs[..., 0]
-        return out.view(B, N, C)
-
 # class SyncModule(nn.Module):
 #     """
 #     Coupling / Synchronization.
@@ -76,6 +49,32 @@ class OmegaModule(nn.Module):
 
 #         # attn
 #         return self.net(x)
+class OmegaModule(nn.Module):
+    def __init__(self, n, ch, init_omg=0.1, global_omg=False, learn_omg=True):
+        super().__init__()
+        self.n = n
+        self.ch = ch
+        self.global_omg = global_omg
+        if n % 2 != 0:
+            raise NotImplementedError("n must be even for OmegaModule (pairwise oscillators).")
+
+        shape = (1, 1) if global_omg else (ch // 2, 1)
+        self.omega_param = nn.Parameter(
+            init_omg * (1 / np.sqrt(2)) * torch.ones(shape),
+            requires_grad=learn_omg
+        )
+
+    def forward(self, x):  # x: [B,N,C]
+        B, N, C = x.shape
+        x_pairs = x.view(B, N, C // 2, 2)
+        omg = torch.norm(self.omega_param, dim=-1, keepdim=True)
+        if not self.global_omg:
+            omg = omg.view(1, 1, C // 2, 1)
+        out = torch.empty_like(x_pairs)
+        out[..., 0] =  omg * x_pairs[..., 1]
+        out[..., 1] = -omg * x_pairs[..., 0]
+        return out.view(B, N, C)
+
 
 class SyncModule(nn.Module):
     """
@@ -118,6 +117,7 @@ class SyncModule(nn.Module):
             self.net = Attention(ch, heads=heads, weight="fc")
 
         elif J == "adj":
+            # self.net = adj_connectivity(self.feature_dim)
             self.use_A = bool(use_A)
             self.A_rank = int(A_rank)
             self.A_act = str(A_act).lower()
@@ -158,27 +158,33 @@ class SyncModule(nn.Module):
 
     def _build_K(self, W: torch.Tensor) -> torch.Tensor:
         """
-        W: [B,N,N] dense
-        Return K: [B,N,N]
+        W: [B,N,N] dense adjacency (non-negative preferred)
+        Return K: [B,N,N] symmetric coupling
         """
-        # symmetrize W 
+        # 1) symmetrize
         W = 0.5 * (W + W.transpose(-1, -2))
+
+        # (optional) ensure non-negative coupling if desired
+        # W = W.clamp_min(0.)
 
         if not self.use_A:
             K = W
         else:
             B, N, _ = W.shape
-            U = self._ensure_U(N, W.device, W.dtype)        # [N,r]
-            A = U @ U.t()                                   # [N,N] symmetric
-            A = A.unsqueeze(0).expand(B, -1, -1)            # [B,N,N]
-            A = self._apply_A_activation(A)
-            K = W * A                                       # Hadamard: K = W ⊙ A
+            U = self._ensure_U(N, W.device, W.dtype)      # [N,r]
+            A = U @ U.t()                                 # [N,N] symmetric PSD
+            A = self._apply_A_activation(A)               # e.g., sigmoid -> (0,1)
+            A = A.unsqueeze(0).expand(B, -1, -1)          # [B,N,N]
+            K = W * A                                     # Hadamard
 
+        # 2) symmetric normalization (keeps K symmetric)
         if self.normalize_K:
-            deg = K.sum(dim=-1).clamp_min(self.eps)         # [B,N]
-            K = K / deg.unsqueeze(-1)                       # row-normalize
+            deg = K.sum(dim=-1).clamp_min(self.eps)       # [B,N]
+            D_inv_sqrt = torch.diag_embed(deg.rsqrt())    # [B,N,N]
+            K = D_inv_sqrt @ K @ D_inv_sqrt               # symmetric norm
 
         return K
+
 
     # -------------------------
     # forward
@@ -232,14 +238,14 @@ class Kuramoto_Solver(nn.Module):
         self.omega_module = OmegaModule(n, ch, init_omg, global_omg, learn_omg) if use_omega else None
         # self.sync_module = SyncModule(J, ch, heads=heads, learn_wscale=False)
         self.sync_module = SyncModule(
-    J, ch,
-    heads=heads,
-    learn_wscale=False,  
-    use_A=True,           
-    A_rank=16,            
-    A_act="sigmoid",      
-    normalize_K=False,     
-)
+        J, ch,
+        heads=heads,
+        learn_wscale=False,  
+        use_A=True,           
+        A_rank=16,            
+        A_act="sigmoid",      
+        normalize_K=False,     
+    )
 
         # self.sync_module = SyncModule(J, ch, heads, feature_dim)
         self.return_energy = return_energy
