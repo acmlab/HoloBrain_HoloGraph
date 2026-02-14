@@ -7,7 +7,7 @@ import numpy as np
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_dense_adj
 from torch.optim.lr_scheduler import _LRScheduler
-
+import logging
 
 class LinearWarmupScheduler(_LRScheduler):
     def __init__(self, optimizer, warmup_iters, last_iter=-1):
@@ -311,3 +311,71 @@ def class_mix_score(X, y, delta=1e-6, eps=1e-8, X0=None, distance_type='euclidea
     else:
         return rho
 
+def create_logger(logging_dir):
+    """
+    Creates a logger that writes to both file and stdout.
+    """
+    if not os.path.exists(logging_dir):
+        os.makedirs(logging_dir)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[\033[34m%(asctime)s\033[0m] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(f"{logging_dir}/log.txt", mode='w'),
+        ],
+        force=True
+    )
+    logger = logging.getLogger(__name__)
+    return logger
+
+class SpectralNetLoss(nn.Module):
+    def __init__(self):
+        super(SpectralNetLoss, self).__init__()
+
+    def forward(self, W, Y):
+        """
+        Args:
+            W: Affinity matrix (Adjacency) [Batch, N, N] or [N, N]
+            Y: Output embeddings [Batch, N, K] or [N, K]
+        Returns:
+            Spectral Loss: Trace(Y.T * L * Y) / Batch_Size
+            (Minimizing this is equivalent to Spectral Clustering objective)
+        """
+        # Ensure batch dimension
+        if W.dim() == 2:
+            W = W.unsqueeze(0)
+        if Y.dim() == 2:
+            Y = Y.unsqueeze(0)
+            
+        B, N, _ = W.shape
+        
+        # 1. Compute Degree Matrix D
+        # D is diagonal matrix where D_ii = sum_j(W_ij)
+        D = torch.diag_embed(W.sum(dim=1))
+        
+        # 2. Compute Laplacian L = D - W
+        L = D - W
+        
+        # 3. Compute Trace(Y^T * L * Y)
+        # Y: [B, N, K] -> Y.T: [B, K, N]
+        # L: [B, N, N]
+        # term: Y.T @ L @ Y -> [B, K, K]
+        
+        # Note: Usually SpectralNet also enforces Y^T * Y = I (Orthonormality).
+        # Assuming the model architecture (like HoloGraph) or explicit constraints handle scale,
+        # we focus on the Laplacian Trace minimization here.
+        
+        loss = 0
+        for i in range(B):
+            y_i = Y[i] # [N, K]
+            l_i = L[i] # [N, N]
+            # loss += Trace(y_i.T @ l_i @ y_i)
+            # More efficient: sum((y_i.T @ l_i) * y_i.T)
+            term = torch.matmul(y_i.t(), torch.matmul(l_i, y_i))
+            loss += torch.trace(term)
+            
+        # Normalize by batch size and nodes to keep loss magnitude reasonable
+        return loss / (B * N * N)
