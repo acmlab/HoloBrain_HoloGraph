@@ -26,7 +26,6 @@ class HoloGraph(nn.Module):
         num_class=4,
         feature_dim=None,
         J="attn",
-        ksize=1,
         c_norm="gn",
         gamma=1.0,
         use_omega=False,
