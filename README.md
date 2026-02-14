@@ -76,7 +76,7 @@ dataset = create_dataset(args.data)
 For homophilic graphs such as the Planetoid dataset Cora, you can run:
 
 ```bash
-python train_node_merged.py \
+python train_node.py \
   --data Cora \
   --lr 0.0005 \
   --ch 1024 \
@@ -93,7 +93,7 @@ python train_node_merged.py \
 For heterophilic graphs, you can run:
 
 ```bash
-python train_node_merged.py \
+python train_node.py \
   --data Wisconsin \
   --lr 0.001 \
   --ch 256 \
