@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
 from torch_geometric.utils import to_dense_adj
 
-from source.modules.kuramoto_layer import Kuramoto_Solver
+from source.modules.kuramoto_solver import Kuramoto_Solver
 
 from source.utils import ReadOutConv, MultiConv1D
 from source.modules.GST import GSTWavelet
