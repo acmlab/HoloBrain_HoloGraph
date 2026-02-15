@@ -25,6 +25,7 @@ class HoloGraph(nn.Module):
         Q=8,             
         num_class=4,
         feature_dim=None,
+        num_node=None,
         J="attn",
         c_norm="gn",
         gamma=1.0,
@@ -59,6 +60,7 @@ class HoloGraph(nn.Module):
         self.feature_dim = feature_dim
         self.num_class = num_class
         self.feature_dim = feature_dim
+        self.num_node = num_node
         self.homo = homo
         self.gst_total = gst_total
         self.encoder_y1 = GCNConv(feature_dim, ch)
@@ -124,7 +126,7 @@ class HoloGraph(nn.Module):
                 global_omg=global_omg,
                 heads=heads,
                 learn_omg=learn_omg,
-                feature_dim=self.feature_dim,
+                feature_dim=self.num_node,
                 return_energy=False,
             )
             
@@ -212,7 +214,7 @@ class HoloGraph(nn.Module):
     
         
         # Original x assignment (commented out), basically for node classification, can comment GST module 
-        # x = c.clone()  
+        # x = y.clone()  
 
         
         saved_y = y.clone()
@@ -226,7 +228,6 @@ class HoloGraph(nn.Module):
 
         for i, (kblock, ro) in enumerate(self.layers):
             # identity = x
-            # [Rename]: Pass Q instead of T
             _xs, _es, save_x = kblock(x, y, inp_sc, Q=self.Q[i], gamma=self.gamma)
             x = _xs[-1]  # [1, N, C]
             
@@ -397,7 +398,7 @@ class HoloBrain(nn.Module):
                 global_omg=global_omg,
                 heads=heads,
                 learn_omg=learn_omg,
-                feature_dim=self.feature_dim
+                feature_dim=self.num_nodes
             )
             
             readout = ReadOutConv(ch, ch_next, self.n, 1, 1, 0, self.homo)
