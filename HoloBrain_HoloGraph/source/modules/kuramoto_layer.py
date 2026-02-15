@@ -82,10 +82,10 @@ class SyncModule(nn.Module):
 
     - conv: GCNConv (edge_index)
     - attn: Attention (uses x only)
-    - adj : dense coupling using K @ x, where K = W ⊙ A 
+    - adj : dense coupling using K @ x, where K = W ⊙ A (or - adj : dense coupling using adj_connectivity:  (W ⊙ Theta) @ x)
             A is chosen as a low-rank symmetric learnable matrix: A = U U^T.
 
-    Args (adj mode):
+    Args (adj mode): 
       - A_rank: rank r for U ∈ R^{N×r}; params ~ N*r (safe for large N)
       - A_act:  "sigmoid" (default) -> gate in (0,1), stable
                "softplus" -> positive gate
@@ -106,6 +106,7 @@ class SyncModule(nn.Module):
         A_act: str = "sigmoid",
         normalize_K: bool = True,
         eps: float = 1e-12,
+        num_nodes: int = None,
     ):
         super().__init__()
         self.type = J
@@ -117,7 +118,7 @@ class SyncModule(nn.Module):
             self.net = Attention(ch, heads=heads, weight="fc")
 
         elif J == "adj":
-            # self.net = adj_connectivity(self.feature_dim)
+            self.net = adj_connectivity(num_nodes) # for brain data
             self.use_A = bool(use_A)
             self.A_rank = int(A_rank)
             self.A_act = str(A_act).lower()
@@ -208,8 +209,10 @@ class SyncModule(nn.Module):
             elif W.dim() != 3:
                 raise ValueError(f"adj expects W as [N,N] or [B,N,N], got {tuple(W.shape)}")
 
-            K = self._build_K(W)                    # [B,N,N]
-            return self.w_scale * torch.bmm(K, x)   # [B,N,C]
+            # K = self._build_K(W)                    # [B,N,N] for graph data
+            # return self.w_scale * torch.bmm(K, x)   # [B,N,C] for graph data
+            out = self.net(x,W) # for brain data
+            return self.w_scale * out # for brain data
 
         # attn
         return self.net(x)
@@ -240,11 +243,12 @@ class Kuramoto_Solver(nn.Module):
         self.sync_module = SyncModule(
         J, ch,
         heads=heads,
-        learn_wscale=False,  
+        learn_wscale=False, 
+        num_nodes=feature_dim, 
         use_A=True,           
         A_rank=16,            
         A_act="sigmoid",      
-        normalize_K=False,     
+        normalize_K=True,     
     )
 
         # self.sync_module = SyncModule(J, ch, heads, feature_dim)
